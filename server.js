@@ -42,7 +42,7 @@ app.post("/create-payment", (req, res) => {
     last_name,
     email,
     phone,
-    response_url: "https://directpay-backend.onrender.com/callback"
+    response_url: "https://www.api.redtrex.store/callback"
   };
 
   const payloadString = JSON.stringify(payload);
