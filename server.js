@@ -12,7 +12,9 @@ const {
   DIRECTPAY_SECRET,
   ADMIN_TOKEN,
   ORDERS_WORKER_URL = "https://redtrex-coupons.projectmmdoffcialdev.workers.dev",
-  ORDERS_API_KEY
+  ORDERS_API_KEY,
+  EMAIL_WORKER_URL = "https://resend.projectmmdoffcialdev.workers.dev",
+  ORDER_EMAIL_TOKEN
 } = process.env;
 
 const COOKIE_NAME = "rt_admin";
@@ -226,6 +228,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
   if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${error}</p>`);
 
   const success = req.query.saved === "1" ? `<div class="ok">✓ Order updated successfully.</div>` : "";
+  const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
   const items = Array.isArray(order.items) && order.items.length > 0
     ? order.items
     : [{ name: order.product_name || "Item", quantity: order.qty || 1 }];
@@ -256,7 +259,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
     </style></head><body>
     <a class="back" href="/admin">← Back to all orders</a>
     <h1>Manage Order: <code>${order.order_id}</code></h1>
-    ${success}
+    ${success}${emailed}
     <div class="card">
       <div class="row"><span>Status</span><span>${statusBadgeHtml(order.status)}</span></div>
       <div class="row"><span>Placed</span><span>${new Date(order.ts).toLocaleString()}</span></div>
@@ -289,6 +292,10 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       <label for="product_keys">Product Keys <small>(one per line — visible to customer when status is Completed)</small></label>
       <textarea name="product_keys" id="product_keys" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX">${keysText}</textarea>
 
+      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
+        💡 Setting status to <strong>Completed</strong> will automatically email the customer their keys.
+      </p>
+
       <div style="margin-top:16px">
         <button class="btn" type="submit">Save Changes</button>
       </div>
@@ -296,7 +303,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
   </body></html>`);
 });
 
-// Save order updates from admin
+// Save order updates from admin (auto-emails customer when status flips to Completed)
 app.post("/admin/order/:id", requireAdmin, async (req, res) => {
   const order_id = req.params.id;
   const status = (req.body.status || "").toString();
@@ -304,8 +311,47 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
   const product_keys = keysRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 
   try {
+    // Fetch the previous order so we can detect a transition into Completed
+    let previous = null;
+    try {
+      const r = await workerFetch(`/orders/get/${encodeURIComponent(order_id)}`);
+      if (r.ok) previous = await r.json();
+    } catch (_) {}
+
     await updateOrderInKV({ order_id, status, product_keys });
-    res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1`);
+
+    // Auto-email customer ONLY when status moves into "Completed" with keys present
+    let emailed = false;
+    const becameCompleted = status === "Completed" && (!previous || previous.status !== "Completed");
+    if (becameCompleted && product_keys.length > 0 && previous?.customer?.email && ORDER_EMAIL_TOKEN) {
+      try {
+        const emailRes = await fetch(`${EMAIL_WORKER_URL}/send-order-email`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${ORDER_EMAIL_TOKEN}`
+          },
+          body: JSON.stringify({
+            to: previous.customer.email,
+            customer_name: `${previous.customer.first_name || ""} ${previous.customer.last_name || ""}`.trim() || "Customer",
+            order_id,
+            items: previous.items || [],
+            product_keys,
+            amount: previous.amount
+          })
+        });
+        if (!emailRes.ok) {
+          console.error(`[email] failed (${emailRes.status}):`, await emailRes.text());
+        } else {
+          console.log(`[email] sent to ${previous.customer.email} for ${order_id}`);
+          emailed = true;
+        }
+      } catch (e) {
+        console.error("[email] error:", e.message);
+      }
+    }
+
+    res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1${emailed ? "&emailed=1" : ""}`);
   } catch (e) {
     res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${e.message} <a href="/admin/order/${encodeURIComponent(order_id)}">← Try again</a></p>`);
   }
