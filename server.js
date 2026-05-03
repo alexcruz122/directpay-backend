@@ -1,3 +1,10 @@
+// =============================================================================
+// RedTrex Render Backend (api.redtrex.store)
+// -----------------------------------------------------------------------------
+// IMPORTANT: This file is for your RENDER service repo, NOT for this Replit
+// project. The local /server.js in this Replit just serves static HTML pages.
+// =============================================================================
+
 import express from "express";
 import crypto from "crypto";
 import cors from "cors";
@@ -19,8 +26,8 @@ const {
 
 const COOKIE_NAME = "rt_admin";
 const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7;
-
 const SERVICE_STATUSES = ["Pending", "Reviewing", "Scheduled", "In Progress", "Completed", "Cancelled"];
+const SERVICE_TYPES = ["Software Installation", "Activation Help", "Data Recovery", "IT Support", "PC Repair", "Network Setup", "Custom"];
 
 // ===== Cookie helpers =====
 function parseCookies(header = "") {
@@ -58,18 +65,27 @@ async function saveOrderToKV(order) {
 }
 async function updateOrderInKV(payload) {
   const res = await workerFetch("/orders/update", { method: "POST", body: JSON.stringify(payload) });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Worker update failed (${res.status}): ${txt}`);
-  }
+  if (!res.ok) throw new Error(`Worker update failed (${res.status}): ${await res.text()}`);
+  return res.json();
+}
+async function deleteOrderInKV(order_id) {
+  const res = await workerFetch("/orders/delete", { method: "POST", body: JSON.stringify({ order_id }) });
+  if (!res.ok) throw new Error(`Worker delete failed (${res.status}): ${await res.text()}`);
   return res.json();
 }
 async function updateServiceInKV(payload) {
   const res = await workerFetch("/services/update", { method: "POST", body: JSON.stringify(payload) });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Worker service update failed (${res.status}): ${txt}`);
-  }
+  if (!res.ok) throw new Error(`Worker service update failed (${res.status}): ${await res.text()}`);
+  return res.json();
+}
+async function deleteServiceInKV(service_id) {
+  const res = await workerFetch("/services/delete", { method: "POST", body: JSON.stringify({ service_id }) });
+  if (!res.ok) throw new Error(`Worker service delete failed (${res.status}): ${await res.text()}`);
+  return res.json();
+}
+async function adminCreateServiceInKV(payload) {
+  const res = await workerFetch("/services/admin-create", { method: "POST", body: JSON.stringify(payload) });
+  if (!res.ok) throw new Error(`Worker admin-create failed (${res.status}): ${await res.text()}`);
   return res.json();
 }
 
@@ -104,7 +120,6 @@ function statusBadgeHtml(status) {
   return `<span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${bg};color:${color};font-size:11px;font-weight:700;text-transform:uppercase">${label}</span>`;
 }
 function serviceBadgeHtml(status) {
-  const s = (status || "Pending");
   const map = {
     "Pending":     ["rgba(245,158,11,.15)", "#fbbf24"],
     "Reviewing":   ["rgba(59,130,246,.15)", "#60a5fa"],
@@ -113,15 +128,28 @@ function serviceBadgeHtml(status) {
     "Completed":   ["rgba(22,163,74,.15)",  "#4ade80"],
     "Cancelled":   ["rgba(239,68,68,.15)",  "#f87171"]
   };
-  const [bg, color] = map[s] || map["Pending"];
-  return `<span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${bg};color:${color};font-size:11px;font-weight:700;text-transform:uppercase">${s}</span>`;
+  const [bg, color] = map[status] || map["Pending"];
+  return `<span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${bg};color:${color};font-size:11px;font-weight:700;text-transform:uppercase">${status || "Pending"}</span>`;
 }
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
 function adminTabsHtml(active) {
-  const tab = (href, label, isActive) => `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
+  const tab = (href, label, isActive) =>
+    `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
   return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tab("/admin","🛒 Orders",active==="orders")}${tab("/admin/services","🛠️ Service Requests",active==="services")}</div>`;
+}
+function dangerZoneFormHtml(action, label) {
+  return `
+    <form class="card" method="POST" action="${action}"
+      onsubmit="return confirm('Permanently delete this ${label}? This cannot be undone.')"
+      style="border-color:#7f1d1d">
+      <strong style="font-size:16px;color:#f87171">⚠ Danger Zone</strong>
+      <p style="color:#94a3b8;font-size:13px;margin:8px 0 12px">Type <code>DELETE</code> below to permanently remove this ${label} from KV.</p>
+      <input name="confirm" placeholder="Type DELETE to confirm" required autocomplete="off"
+        style="width:100%;padding:10px 12px;background:#0f172a;border:1px solid #7f1d1d;border-radius:6px;color:#fff;font-family:inherit;box-sizing:border-box">
+      <button type="submit" style="margin-top:12px;padding:10px 18px;background:#7f1d1d;color:#fff;border:none;border-radius:6px;font-weight:700;cursor:pointer">Delete ${label}</button>
+    </form>`;
 }
 
 // ===== Public root =====
@@ -169,6 +197,8 @@ app.get("/admin", requireAdmin, async (req, res) => {
     all = data.orders || [];
   } catch (e) { fetchError = e.message; }
 
+  const deleted = req.query.deleted ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ Deleted ${escapeHtml(req.query.deleted)}</div>` : "";
+
   const rows = all.map(o => {
     const items = Array.isArray(o.items) && o.items.length > 0
       ? o.items.map(it => `${escapeHtml(it.name)} ×${it.quantity || it.qty || 1}`).join("<br>")
@@ -203,6 +233,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
       code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:11px}
     </style></head><body>
     ${adminTabsHtml("orders")}
+    ${deleted}
     <div class="head">
       <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
       <div style="display:flex;gap:8px">
@@ -219,50 +250,37 @@ app.get("/admin", requireAdmin, async (req, res) => {
     </table></body></html>`);
 });
 
-// ===== Admin: create test order =====
 app.post("/admin/seed-test", requireAdmin, async (req, res) => {
   const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
   const order_id = `ORD-TEST-${rand}`;
-  const testOrder = {
-    ts: Date.now(),
-    order_id,
-    amount: 4500,
+  await saveOrderToKV({
+    ts: Date.now(), order_id, amount: 4500,
     items: [
       { name: "Windows 11 Pro (TEST)", quantity: 1 },
       { name: "EaseUS Data Recovery (TEST)", quantity: 1 }
     ],
     coupon_code: "TESTCOUPON10",
-    customer: {
-      first_name: "Test",
-      last_name: "Customer",
-      email: "test@redtrex.com",
-      phone: "+94712622012"
-    },
+    customer: { first_name: "Test", last_name: "Customer", email: "test@redtrex.com", phone: "+94712622012" },
     status: "Pending"
-  };
-  await saveOrderToKV(testOrder);
+  });
   console.log(`[seed-test] created ${order_id}`);
   res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1`);
 });
 
-// ===== Admin: single order edit page =====
 app.get("/admin/order/:id", requireAdmin, async (req, res) => {
   let order = null, error = null;
   try {
     const r = await workerFetch(`/orders/get/${encodeURIComponent(req.params.id)}`);
-    if (r.status === 404) {
+    if (r.status === 404)
       return res.status(404).send(`<p style="font-family:system-ui;padding:30px;color:#fff;background:#0f172a">Order not found. <a href="/admin" style="color:#f87171">← Back</a></p>`);
-    }
     order = await r.json();
   } catch (e) { error = e.message; }
-
   if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
   const success = req.query.saved === "1" ? `<div class="ok">✓ Order updated successfully.</div>` : "";
   const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
-  const items = Array.isArray(order.items) && order.items.length > 0
-    ? order.items
-    : [{ name: order.product_name || "Item", quantity: order.qty || 1 }];
+  const delerr  = req.query.delerr === "1" ? `<div class="err" style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ You must type <code>DELETE</code> to confirm deletion.</div>` : "";
+  const items = Array.isArray(order.items) && order.items.length > 0 ? order.items : [{ name: order.product_name || "Item", quantity: order.qty || 1 }];
   const keys = Array.isArray(order.product_keys) ? order.product_keys : [];
   const keysText = keys.join("\n");
 
@@ -290,7 +308,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
     </style></head><body>
     <a class="back" href="/admin">← Back to all orders</a>
     <h1>Manage Order: <code>${escapeHtml(order.order_id)}</code></h1>
-    ${success}${emailed}
+    ${success}${emailed}${delerr}
     <div class="card">
       <div class="row"><span>Status</span><span>${statusBadgeHtml(order.status)}</span></div>
       <div class="row"><span>Placed</span><span>${new Date(order.ts).toLocaleString()}</span></div>
@@ -311,7 +329,6 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
 
     <form class="card" method="POST" action="/admin/order/${encodeURIComponent(order.order_id)}">
       <strong style="font-size:16px">Update Order</strong>
-
       <label for="status">Status</label>
       <select name="status" id="status">
         <option value="Pending"   ${order.status === "Pending"   ? "selected" : ""}>Pending (paid, awaiting fulfillment)</option>
@@ -319,22 +336,16 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
         <option value="Cancelled" ${order.status === "Cancelled" ? "selected" : ""}>Cancelled</option>
         <option value="Refunded"  ${order.status === "Refunded"  ? "selected" : ""}>Refunded</option>
       </select>
-
       <label for="product_keys">Product Keys <small>(one per line — visible to customer when status is Completed)</small></label>
       <textarea name="product_keys" id="product_keys" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX">${escapeHtml(keysText)}</textarea>
-
-      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
-        💡 Setting status to <strong>Completed</strong> will automatically email the customer their keys.
-      </p>
-
-      <div style="margin-top:16px">
-        <button class="btn" type="submit">Save Changes</button>
-      </div>
+      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">💡 Setting status to <strong>Completed</strong> will automatically email the customer their keys.</p>
+      <div style="margin-top:16px"><button class="btn" type="submit">Save Changes</button></div>
     </form>
+
+    ${dangerZoneFormHtml(`/admin/order/${encodeURIComponent(order.order_id)}/delete`, "Order")}
   </body></html>`);
 });
 
-// Save order updates from admin (auto-emails customer when status flips to Completed)
 app.post("/admin/order/:id", requireAdmin, async (req, res) => {
   const order_id = req.params.id;
   const status = (req.body.status || "").toString();
@@ -356,10 +367,7 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
       try {
         const emailRes = await fetch(`${EMAIL_WORKER_URL}/send-order-email`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${ORDER_EMAIL_TOKEN}`
-          },
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ORDER_EMAIL_TOKEN}` },
           body: JSON.stringify({
             to: previous.customer.email,
             customer_name: `${previous.customer.first_name || ""} ${previous.customer.last_name || ""}`.trim() || "Customer",
@@ -369,20 +377,27 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
             amount: previous.amount
           })
         });
-        if (!emailRes.ok) {
-          console.error(`[email] failed (${emailRes.status}):`, await emailRes.text());
-        } else {
-          console.log(`[email] sent to ${previous.customer.email} for ${order_id}`);
-          emailed = true;
-        }
-      } catch (e) {
-        console.error("[email] error:", e.message);
-      }
+        if (!emailRes.ok) console.error(`[email] failed (${emailRes.status}):`, await emailRes.text());
+        else { console.log(`[email] sent to ${previous.customer.email} for ${order_id}`); emailed = true; }
+      } catch (e) { console.error("[email] error:", e.message); }
     }
 
     res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1${emailed ? "&emailed=1" : ""}`);
   } catch (e) {
     res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${escapeHtml(e.message)} <a href="/admin/order/${encodeURIComponent(order_id)}">← Try again</a></p>`);
+  }
+});
+
+app.post("/admin/order/:id/delete", requireAdmin, async (req, res) => {
+  const order_id = req.params.id;
+  const confirm = (req.body.confirm || "").toString().trim().toUpperCase();
+  if (confirm !== "DELETE") return res.redirect(`/admin/order/${encodeURIComponent(order_id)}?delerr=1`);
+  try {
+    await deleteOrderInKV(order_id);
+    console.log(`[admin] deleted order ${order_id}`);
+    res.redirect(`/admin?deleted=${encodeURIComponent(order_id)}`);
+  } catch (e) {
+    res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Delete failed: ${escapeHtml(e.message)} <a href="/admin/order/${encodeURIComponent(order_id)}">← Back</a></p>`);
   }
 });
 
@@ -395,9 +410,12 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
     all = data.services || [];
   } catch (e) { fetchError = e.message; }
 
+  const deleted = req.query.deleted ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ Deleted ${escapeHtml(req.query.deleted)}</div>` : "";
+  const created = req.query.newsvc ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ New service request created. Share the SVC-ID with the customer.</div>` : "";
+
   const rows = all.map(s => `
     <tr>
-      <td><a href="/admin/service/${encodeURIComponent(s.service_id)}" style="color:#f87171;text-decoration:none"><code>${escapeHtml(s.service_id)}</code></a></td>
+      <td><a href="/admin/service/${encodeURIComponent(s.service_id)}" style="color:#f87171;text-decoration:none"><code>${escapeHtml(s.service_id)}</code></a>${s.created_by === "admin" ? ' <small style="color:#a5b4fc">(admin)</small>' : ""}</td>
       <td>${new Date(s.ts).toLocaleString()}</td>
       <td>${escapeHtml(s.customer?.first_name || "")} ${escapeHtml(s.customer?.last_name || "")}<br>
           <small style="color:#94a3b8">${escapeHtml(s.customer?.email || "")}<br>${escapeHtml(s.customer?.phone || "")}</small></td>
@@ -423,11 +441,13 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
       code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:11px}
     </style></head><body>
     ${adminTabsHtml("services")}
+    ${deleted}${created}
     <div class="head">
       <h1>🛠️ Service Requests <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <a href="/admin/services/new" style="background:#dc2626;color:#fff;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:700">+ New Service Request</a>
         <form method="POST" action="/admin/services/seed-test" style="margin:0">
-          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Create Test Request</button>
+          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Test Request</button>
         </form>
         <a class="logout" href="/logout">Sign Out</a>
       </div>
@@ -439,18 +459,14 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
     </table></body></html>`);
 });
 
-// ===== Admin: create test service request =====
 app.post("/admin/services/seed-test", requireAdmin, async (req, res) => {
-  // Use the public create endpoint so the worker generates a real SVC-ID
   try {
     const r = await fetch(`${ORDERS_WORKER_URL}/services/create`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        first_name: "Test",
-        last_name: "Customer",
-        email: "test@redtrex.com",
-        phone: "+94712622012",
+        first_name: "Test", last_name: "Customer",
+        email: "test@redtrex.com", phone: "+94712622012",
         service_type: "IT Support",
         description: "This is a seeded test request to verify the admin workflow end-to-end."
       })
@@ -463,23 +479,106 @@ app.post("/admin/services/seed-test", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== Admin: single service request edit page =====
+// ===== Admin: NEW service request form =====
+app.get("/admin/services/new", requireAdmin, (req, res) => {
+  const err = req.query.err ? `<div style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ ${escapeHtml(req.query.err)}</div>` : "";
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>New Service Request</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0 auto;max-width:760px}
+      a.back{color:#f87171;text-decoration:none;font-size:13px;display:inline-block;margin-bottom:14px}
+      h1{font-size:22px;margin:0 0 14px;color:#f87171}
+      .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px}
+      label{display:block;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
+      input,select,textarea{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box}
+      textarea{min-height:120px;resize:vertical}
+      input:focus,select:focus,textarea:focus{border-color:#f87171}
+      .btn{display:inline-block;padding:11px 22px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
+      .btn:hover{background:#b91c1c}
+      .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+      @media(max-width:600px){.grid{grid-template-columns:1fr}}
+      small{color:#64748b;font-size:12px}
+    </style></head><body>
+    <a class="back" href="/admin/services">← Back to all requests</a>
+    <h1>➕ Create New Service Request</h1>
+    ${err}
+    <p style="color:#94a3b8;font-size:14px;margin:0 0 16px">Use this when a customer contacts you by phone/WhatsApp instead of the website. They'll be able to track it using their email + the SVC-ID you give them.</p>
+    <form class="card" method="POST" action="/admin/services/new">
+      <div class="grid">
+        <div><label>First Name *</label><input name="first_name" required maxlength="60"></div>
+        <div><label>Last Name *</label><input name="last_name" required maxlength="60"></div>
+      </div>
+      <div class="grid">
+        <div><label>Email *</label><input type="email" name="email" required maxlength="160"></div>
+        <div><label>Phone *</label><input name="phone" required maxlength="30" placeholder="+947..."></div>
+      </div>
+
+      <label>Service Type *</label>
+      <select name="service_type" required>${SERVICE_TYPES.map(t => `<option value="${t}">${t}</option>`).join("")}</select>
+
+      <label>Description *</label>
+      <textarea name="description" required minlength="15" maxlength="2500" placeholder="What does the customer need?"></textarea>
+
+      <div class="grid">
+        <div><label>Preferred Date <small>(optional)</small></label><input name="preferred_date" placeholder="e.g. Saturday morning"></div>
+        <div><label>Location <small>(optional)</small></label><input name="location" placeholder="Negombo / Remote"></div>
+      </div>
+
+      <div class="grid">
+        <div><label>Initial Status</label><select name="status">${SERVICE_STATUSES.map(s => `<option value="${s}" ${s === "Pending" ? "selected" : ""}>${s}</option>`).join("")}</select></div>
+        <div><label>Quote (LKR) <small>(optional)</small></label><input type="number" name="quote_amount" min="0" step="0.01" value="0"></div>
+      </div>
+
+      <label>Scheduled For <small>(optional, visible to customer)</small></label>
+      <input name="scheduled_for" placeholder="e.g. Saturday 2026-05-10 at 2:00 PM">
+
+      <label>Note to Customer <small>(optional, visible on tracking page)</small></label>
+      <textarea name="admin_note" placeholder="Any message you want them to see when they track."></textarea>
+
+      <div style="margin-top:18px"><button class="btn" type="submit">Create Request</button></div>
+    </form>
+  </body></html>`);
+});
+
+app.post("/admin/services/new", requireAdmin, async (req, res) => {
+  try {
+    const payload = {
+      first_name: req.body.first_name,
+      last_name: req.body.last_name,
+      email: req.body.email,
+      phone: req.body.phone,
+      service_type: req.body.service_type,
+      description: req.body.description,
+      preferred_date: req.body.preferred_date,
+      location: req.body.location,
+      status: req.body.status,
+      scheduled_for: req.body.scheduled_for,
+      admin_note: req.body.admin_note,
+      quote_amount: Number(req.body.quote_amount) || 0
+    };
+    const result = await adminCreateServiceInKV(payload);
+    console.log(`[admin] created service ${result.service_id} for ${payload.email}`);
+    res.redirect(`/admin/service/${encodeURIComponent(result.service_id)}?saved=1&newsvc=1`);
+  } catch (e) {
+    res.redirect(`/admin/services/new?err=${encodeURIComponent(e.message)}`);
+  }
+});
+
+// ===== Admin: single service request =====
 app.get("/admin/service/:id", requireAdmin, async (req, res) => {
   let svc = null, error = null;
   try {
     const r = await workerFetch(`/services/get/${encodeURIComponent(req.params.id)}`);
-    if (r.status === 404) {
+    if (r.status === 404)
       return res.status(404).send(`<p style="font-family:system-ui;padding:30px;color:#fff;background:#0f172a">Request not found. <a href="/admin/services" style="color:#f87171">← Back</a></p>`);
-    }
     svc = await r.json();
   } catch (e) { error = e.message; }
-
   if (!svc) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
   const success = req.query.saved === "1" ? `<div class="ok">✓ Request updated successfully.</div>` : "";
-  const statusOpts = SERVICE_STATUSES.map(s =>
-    `<option value="${s}" ${svc.status === s ? "selected" : ""}>${s}</option>`
-  ).join("");
+  const newSvc  = req.query.newsvc === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📬 Share these with the customer:<br><strong>SVC-ID:</strong> <code>${escapeHtml(svc.service_id)}</code><br><strong>Email:</strong> <code>${escapeHtml(svc.customer?.email || "")}</code><br>Tracking page: <a href="https://www.redtrex.com.lk/track-service" style="color:#a5b4fc">redtrex.com.lk/track-service</a></div>` : "";
+  const delerr  = req.query.delerr === "1" ? `<div class="err" style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ You must type <code>DELETE</code> to confirm deletion.</div>` : "";
+  const statusOpts = SERVICE_STATUSES.map(s => `<option value="${s}" ${svc.status === s ? "selected" : ""}>${s}</option>`).join("");
 
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Manage Service Request</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -499,15 +598,15 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
       select:focus,textarea:focus,input:focus{border-color:#f87171}
       .btn{display:inline-block;padding:11px 22px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
       .btn:hover{background:#b91c1c}
-      .ok{background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px}
+      .ok{background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px;line-height:1.7}
       small{color:#64748b;font-size:12px}
     </style></head><body>
     <a class="back" href="/admin/services">← Back to all requests</a>
     <h1>Service Request: <code>${escapeHtml(svc.service_id)}</code></h1>
-    ${success}
+    ${success}${newSvc}${delerr}
     <div class="card">
       <div class="row"><span>Status</span><span>${serviceBadgeHtml(svc.status)}</span></div>
-      <div class="row"><span>Submitted</span><span>${new Date(svc.ts).toLocaleString()}</span></div>
+      <div class="row"><span>Submitted</span><span>${new Date(svc.ts).toLocaleString()}${svc.created_by === "admin" ? ' <small style="color:#a5b4fc">(by admin)</small>' : ""}</span></div>
       ${svc.updated_at ? `<div class="row"><span>Updated</span><span>${new Date(svc.updated_at).toLocaleString()}</span></div>` : ""}
       <div class="row"><span>Customer</span><span>${escapeHtml(svc.customer?.first_name || "")} ${escapeHtml(svc.customer?.last_name || "")}</span></div>
       <div class="row"><span>Email</span><span>${escapeHtml(svc.customer?.email || "—")}</span></div>
@@ -524,31 +623,22 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
 
     <form class="card" method="POST" action="/admin/service/${encodeURIComponent(svc.service_id)}">
       <strong style="font-size:16px">Update Request</strong>
-
       <label for="status">Status</label>
       <select name="status" id="status">${statusOpts}</select>
-
       <label for="scheduled_for">Scheduled For <small>(free text — visible to customer)</small></label>
       <input type="text" name="scheduled_for" id="scheduled_for" value="${escapeHtml(svc.scheduled_for || "")}" placeholder="e.g. Saturday 2026-05-10 at 2:00 PM">
-
       <label for="quote_amount">Quote Amount (LKR) <small>(optional — shown on tracking page when &gt; 0)</small></label>
       <input type="number" name="quote_amount" id="quote_amount" min="0" step="0.01" value="${Number(svc.quote_amount) || 0}">
-
       <label for="admin_note">Note to Customer <small>(visible on the tracking page)</small></label>
       <textarea name="admin_note" id="admin_note" placeholder="e.g. We'll arrive Saturday 2pm. Please back up your data first.">${escapeHtml(svc.admin_note || "")}</textarea>
-
-      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
-        💡 The customer can see your status, schedule, quote and note on the tracking page.
-      </p>
-
-      <div style="margin-top:16px">
-        <button class="btn" type="submit">Save Changes</button>
-      </div>
+      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">💡 The customer can see your status, schedule, quote and note on the tracking page.</p>
+      <div style="margin-top:16px"><button class="btn" type="submit">Save Changes</button></div>
     </form>
+
+    ${dangerZoneFormHtml(`/admin/service/${encodeURIComponent(svc.service_id)}/delete`, "Request")}
   </body></html>`);
 });
 
-// Save service request updates from admin
 app.post("/admin/service/:id", requireAdmin, async (req, res) => {
   const service_id = req.params.id;
   const status = (req.body.status || "").toString();
@@ -564,12 +654,23 @@ app.post("/admin/service/:id", requireAdmin, async (req, res) => {
   }
 });
 
+app.post("/admin/service/:id/delete", requireAdmin, async (req, res) => {
+  const service_id = req.params.id;
+  const confirm = (req.body.confirm || "").toString().trim().toUpperCase();
+  if (confirm !== "DELETE") return res.redirect(`/admin/service/${encodeURIComponent(service_id)}?delerr=1`);
+  try {
+    await deleteServiceInKV(service_id);
+    console.log(`[admin] deleted service ${service_id}`);
+    res.redirect(`/admin/services?deleted=${encodeURIComponent(service_id)}`);
+  } catch (e) {
+    res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Delete failed: ${escapeHtml(e.message)} <a href="/admin/service/${encodeURIComponent(service_id)}">← Back</a></p>`);
+  }
+});
+
 // ===== JSON endpoints =====
 app.get("/orders", requireAdmin, async (req, res) => {
-  try {
-    const r = await workerFetch("/orders/list?limit=200");
-    res.json(await r.json());
-  } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
+  try { const r = await workerFetch("/orders/list?limit=200"); res.json(await r.json()); }
+  catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
 });
 app.get("/orders/:id", requireAdmin, async (req, res) => {
   try {
@@ -579,10 +680,8 @@ app.get("/orders/:id", requireAdmin, async (req, res) => {
   } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
 });
 app.get("/services", requireAdmin, async (req, res) => {
-  try {
-    const r = await workerFetch("/services/list?limit=200");
-    res.json(await r.json());
-  } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
+  try { const r = await workerFetch("/services/list?limit=200"); res.json(await r.json()); }
+  catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
 });
 app.get("/services/:id", requireAdmin, async (req, res) => {
   try {
@@ -594,17 +693,13 @@ app.get("/services/:id", requireAdmin, async (req, res) => {
 
 // ===== Payment endpoints =====
 app.post("/create-payment", async (req, res) => {
-  const {
-    order_id, amount,
-    first_name = "", last_name = "", email = "", phone = "",
-    product_name = "", qty = 1, items = [], coupon_code = null
-  } = req.body;
+  const { order_id, amount, first_name = "", last_name = "", email = "", phone = "",
+    product_name = "", qty = 1, items = [], coupon_code = null } = req.body;
   if (!order_id || !amount) return res.status(400).json({ error: "Missing order_id or amount" });
 
   await saveOrderToKV({
     ts: Date.now(), order_id, amount, product_name, qty, items, coupon_code,
-    customer: { first_name, last_name, email, phone },
-    status: "Pending"
+    customer: { first_name, last_name, email, phone }, status: "Pending"
   });
   console.log(`[order] ${order_id} | ${product_name || items.length + " items"} | LKR ${amount}${coupon_code ? ` | coupon ${coupon_code}` : ""}`);
 
