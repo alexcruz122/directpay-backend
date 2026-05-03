@@ -11,54 +11,87 @@ app.use(cors());
 const {
   DIRECTPAY_MERCHANT_ID,
   DIRECTPAY_SECRET,
-  ADMIN_TOKEN  // any random secret string — required to view /orders
+  ADMIN_TOKEN,                                              // browser password for /admin page
+  ORDERS_WORKER_URL = "https://redtrex-coupons.projectmmdoffcialdev.workers.dev",
+  ORDERS_API_KEY                                            // shared secret with the Worker
 } = process.env;
 
-// In-memory log of every order (keyed by order_id).
-// Note: resets when Render restarts/redeploys. For permanent storage,
-// upgrade to Render Postgres later.
-const orderLog = new Map();
+// Helper: call the Cloudflare Worker for order storage
+async function workerFetch(path, opts = {}) {
+  const res = await fetch(`${ORDERS_WORKER_URL}${path}`, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ORDERS_API_KEY}`,
+      ...(opts.headers || {})
+    }
+  });
+  return res;
+}
 
-// Tiny middleware: require ?token=<ADMIN_TOKEN> on admin endpoints
+async function saveOrderToKV(order) {
+  try {
+    const res = await workerFetch("/orders/save", {
+      method: "POST",
+      body: JSON.stringify(order)
+    });
+    if (!res.ok) {
+      console.error(`[kv-save] failed (${res.status}):`, await res.text());
+    }
+  } catch (e) {
+    console.error("[kv-save] error:", e.message);
+  }
+}
+
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) {
-    return res.status(503).json({ error: "Admin endpoint disabled (set ADMIN_TOKEN env var)" });
+    return res.status(503).json({ error: "Admin endpoint disabled (set ADMIN_TOKEN)" });
   }
   const supplied = req.query.token || req.headers["x-admin-token"];
-  if (supplied !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (supplied !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
-app.get("/", (req, res) => {
-  res.send("DirectPay backend running");
+app.get("/", (req, res) => res.send("DirectPay backend running"));
+
+// ===== Admin endpoints (read from Cloudflare KV) =====
+
+app.get("/orders", requireAdmin, async (req, res) => {
+  try {
+    const r = await workerFetch("/orders/list?limit=200");
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: "Failed to fetch orders", detail: e.message });
+  }
 });
 
-// ===== Admin endpoints (require ?token=YOUR_ADMIN_TOKEN) =====
-
-// Latest 100 orders, newest first
-app.get("/orders", requireAdmin, (req, res) => {
-  const all = Array.from(orderLog.values())
-    .sort((a, b) => b.ts - a.ts)
-    .slice(0, 100);
-  res.json({ count: all.length, orders: all });
+app.get("/orders/:id", requireAdmin, async (req, res) => {
+  try {
+    const r = await workerFetch(`/orders/get/${encodeURIComponent(req.params.id)}`);
+    if (r.status === 404) return res.status(404).json({ error: "Not found" });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(502).json({ error: "Failed to fetch order", detail: e.message });
+  }
 });
 
-// Single order lookup by order_id
-app.get("/orders/:id", requireAdmin, (req, res) => {
-  const entry = orderLog.get(req.params.id);
-  if (!entry) return res.status(404).json({ error: "Not found" });
-  res.json(entry);
-});
+app.get("/admin", requireAdmin, async (req, res) => {
+  let all = [];
+  let fetchError = null;
+  try {
+    const r = await workerFetch("/orders/list?limit=500");
+    const data = await r.json();
+    all = data.orders || [];
+  } catch (e) {
+    fetchError = e.message;
+  }
 
-// Quick HTML view for browser convenience: /admin?token=YOUR_TOKEN
-app.get("/admin", requireAdmin, (req, res) => {
-  const all = Array.from(orderLog.values()).sort((a, b) => b.ts - a.ts);
   const rows = all.map(o => {
     const items = Array.isArray(o.items) && o.items.length > 0
-      ? o.items.map(it => `${it.name} x${it.quantity || it.qty || 1}`).join("<br>")
-      : `${o.product_name || ""} x${o.qty || 1}`;
+      ? o.items.map(it => `${it.name} ×${it.quantity || it.qty || 1}`).join("<br>")
+      : `${o.product_name || "—"} ×${o.qty || 1}`;
     const status = o.status || "pending";
     const statusColor = String(status).toUpperCase().includes("SUCCESS")
       ? "#16a34a" : status === "pending" ? "#f59e0b" : "#ef4444";
@@ -69,21 +102,27 @@ app.get("/admin", requireAdmin, (req, res) => {
         <td>${items}</td>
         <td>LKR ${o.amount}</td>
         <td>${o.coupon_code || "-"}</td>
-        <td>${o.customer?.email || ""}<br><small>${o.customer?.phone || ""}</small></td>
+        <td>${o.customer?.first_name || ""} ${o.customer?.last_name || ""}<br>
+            <small>${o.customer?.email || ""}<br>${o.customer?.phone || ""}</small></td>
         <td style="color:${statusColor};font-weight:700">${status}</td>
       </tr>`;
   }).join("");
+
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>RedTrex Orders</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
       body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0}
       h1{color:#f87171;margin:0 0 16px}
+      .err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px}
       table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden}
       th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #334155;font-size:13px;vertical-align:top}
       th{background:#0f172a;color:#94a3b8;text-transform:uppercase;font-size:11px}
       tr:hover td{background:#283548}
       code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:11px}
+      small{color:#94a3b8}
     </style></head><body>
-    <h1>🛒 RedTrex Orders <small style="color:#94a3b8;font-size:14px;font-weight:400">(${all.length} total)</small></h1>
+    <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400">(${all.length} stored)</small></h1>
+    ${fetchError ? `<div class="err">⚠ Could not reach Cloudflare KV: ${fetchError}</div>` : ""}
     <table>
       <thead><tr><th>Order ID</th><th>Time</th><th>Items</th><th>Amount</th><th>Coupon</th><th>Customer</th><th>Status</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#64748b">No orders yet</td></tr>'}</tbody>
@@ -92,7 +131,7 @@ app.get("/admin", requireAdmin, (req, res) => {
 
 // ===== Payment endpoints =====
 
-app.post("/create-payment", (req, res) => {
+app.post("/create-payment", async (req, res) => {
   const {
     order_id,
     amount,
@@ -110,9 +149,8 @@ app.post("/create-payment", (req, res) => {
     return res.status(400).json({ error: "Missing order_id or amount" });
   }
 
-  // Persist the full order context so we can look it up later by order_id.
-  // (DirectPay only shows order_id + amount in their dashboard.)
-  orderLog.set(order_id, {
+  // Persist to Cloudflare KV (survives Render cold starts forever)
+  await saveOrderToKV({
     ts: Date.now(),
     order_id,
     amount,
@@ -123,9 +161,8 @@ app.post("/create-payment", (req, res) => {
     customer: { first_name, last_name, email, phone },
     status: "pending"
   });
-  console.log(`[order] ${order_id} | ${product_name} x${qty} | LKR ${amount}${coupon_code ? ` | coupon ${coupon_code}` : ""}`);
+  console.log(`[order] ${order_id} | ${product_name || items.length + " items"} | LKR ${amount}${coupon_code ? ` | coupon ${coupon_code}` : ""}`);
 
-  // DirectPay IPG payload (only fields they accept)
   const payload = {
     merchant_id: DIRECTPAY_MERCHANT_ID,
     order_id,
@@ -141,24 +178,17 @@ app.post("/create-payment", (req, res) => {
 
   const payloadString = JSON.stringify(payload);
   const dataString = Buffer.from(payloadString).toString("base64");
-  const signature = crypto
-    .createHmac("sha256", DIRECTPAY_SECRET)
-    .update(dataString)
-    .digest("hex");
+  const signature = crypto.createHmac("sha256", DIRECTPAY_SECRET).update(dataString).digest("hex");
 
   res.json({ dataString, signature });
 });
 
-app.post("/callback", (req, res) => {
+app.post("/callback", async (req, res) => {
   console.log("DirectPay callback received");
 
-  const receivedSignature =
-    req.headers["authorization"]?.replace("Bearer ", "");
-
-  const generatedSignature = crypto
-    .createHmac("sha256", DIRECTPAY_SECRET)
-    .update(JSON.stringify(req.body))
-    .digest("hex");
+  const receivedSignature = req.headers["authorization"]?.replace("Bearer ", "");
+  const generatedSignature = crypto.createHmac("sha256", DIRECTPAY_SECRET)
+    .update(JSON.stringify(req.body)).digest("hex");
 
   if (receivedSignature !== generatedSignature) {
     return res.status(403).send("Invalid signature");
@@ -166,14 +196,13 @@ app.post("/callback", (req, res) => {
 
   const { order_id, amount, status } = req.body;
 
-  // Update the log with the final payment status
-  const entry = orderLog.get(order_id);
-  if (entry) {
-    entry.status = status;
-    entry.paid_amount = amount;
-    entry.paid_at = Date.now();
-    orderLog.set(order_id, entry);
-  }
+  // Update the KV record with final payment status (merge keeps prior fields)
+  await saveOrderToKV({
+    order_id,
+    status,
+    paid_amount: amount,
+    paid_at: Date.now()
+  });
   console.log(`[callback] ${order_id} | ${status} | LKR ${amount}`);
 
   const redirectUrl =
@@ -183,7 +212,4 @@ app.post("/callback", (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(PORT, () => console.log("Server running on port", PORT));
