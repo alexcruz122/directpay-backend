@@ -20,6 +20,8 @@ const {
 const COOKIE_NAME = "rt_admin";
 const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7;
 
+const SERVICE_STATUSES = ["Pending", "Reviewing", "Scheduled", "In Progress", "Completed", "Cancelled"];
+
 // ===== Cookie helpers =====
 function parseCookies(header = "") {
   const out = {};
@@ -62,6 +64,14 @@ async function updateOrderInKV(payload) {
   }
   return res.json();
 }
+async function updateServiceInKV(payload) {
+  const res = await workerFetch("/services/update", { method: "POST", body: JSON.stringify(payload) });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Worker service update failed (${res.status}): ${txt}`);
+  }
+  return res.json();
+}
 
 // ===== Auth middleware =====
 function requireAdmin(req, res, next) {
@@ -92,6 +102,26 @@ function statusBadgeHtml(status) {
   else if (s === "cancelled" || s === "canceled" || s === "failed") { bg = "rgba(239,68,68,.15)"; color = "#f87171"; label = "Cancelled"; }
   else if (s === "refunded") { bg = "rgba(99,102,241,.15)"; color = "#a5b4fc"; label = "Refunded"; }
   return `<span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${bg};color:${color};font-size:11px;font-weight:700;text-transform:uppercase">${label}</span>`;
+}
+function serviceBadgeHtml(status) {
+  const s = (status || "Pending");
+  const map = {
+    "Pending":     ["rgba(245,158,11,.15)", "#fbbf24"],
+    "Reviewing":   ["rgba(59,130,246,.15)", "#60a5fa"],
+    "Scheduled":   ["rgba(168,85,247,.15)", "#c084fc"],
+    "In Progress": ["rgba(14,165,233,.15)", "#38bdf8"],
+    "Completed":   ["rgba(22,163,74,.15)",  "#4ade80"],
+    "Cancelled":   ["rgba(239,68,68,.15)",  "#f87171"]
+  };
+  const [bg, color] = map[s] || map["Pending"];
+  return `<span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${bg};color:${color};font-size:11px;font-weight:700;text-transform:uppercase">${s}</span>`;
+}
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+function adminTabsHtml(active) {
+  const tab = (href, label, isActive) => `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
+  return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tab("/admin","🛒 Orders",active==="orders")}${tab("/admin/services","🛠️ Service Requests",active==="services")}</div>`;
 }
 
 // ===== Public root =====
@@ -141,17 +171,17 @@ app.get("/admin", requireAdmin, async (req, res) => {
 
   const rows = all.map(o => {
     const items = Array.isArray(o.items) && o.items.length > 0
-      ? o.items.map(it => `${it.name} ×${it.quantity || it.qty || 1}`).join("<br>")
-      : `${o.product_name || "—"} ×${o.qty || 1}`;
+      ? o.items.map(it => `${escapeHtml(it.name)} ×${it.quantity || it.qty || 1}`).join("<br>")
+      : `${escapeHtml(o.product_name || "—")} ×${o.qty || 1}`;
     return `
       <tr>
-        <td><a href="/admin/order/${encodeURIComponent(o.order_id)}" style="color:#f87171;text-decoration:none"><code>${o.order_id}</code></a></td>
+        <td><a href="/admin/order/${encodeURIComponent(o.order_id)}" style="color:#f87171;text-decoration:none"><code>${escapeHtml(o.order_id)}</code></a></td>
         <td>${new Date(o.ts).toLocaleString()}</td>
         <td>${items}</td>
         <td>LKR ${o.amount}</td>
-        <td>${o.coupon_code || "-"}</td>
-        <td>${o.customer?.first_name || ""} ${o.customer?.last_name || ""}<br>
-            <small style="color:#94a3b8">${o.customer?.email || ""}<br>${o.customer?.phone || ""}</small></td>
+        <td>${escapeHtml(o.coupon_code || "-")}</td>
+        <td>${escapeHtml(o.customer?.first_name || "")} ${escapeHtml(o.customer?.last_name || "")}<br>
+            <small style="color:#94a3b8">${escapeHtml(o.customer?.email || "")}<br>${escapeHtml(o.customer?.phone || "")}</small></td>
         <td>${statusBadgeHtml(o.status)}</td>
         <td><a href="/admin/order/${encodeURIComponent(o.order_id)}" style="background:#dc2626;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:700">Manage</a></td>
       </tr>`;
@@ -172,6 +202,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
       tr:hover td{background:#283548}
       code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:11px}
     </style></head><body>
+    ${adminTabsHtml("orders")}
     <div class="head">
       <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
       <div style="display:flex;gap:8px">
@@ -181,7 +212,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
         <a class="logout" href="/logout">Sign Out</a>
       </div>
     </div>
-    ${fetchError ? `<div class="err">⚠ Could not reach Cloudflare KV: ${fetchError}</div>` : ""}
+    ${fetchError ? `<div class="err">⚠ Could not reach Cloudflare KV: ${escapeHtml(fetchError)}</div>` : ""}
     <table>
       <thead><tr><th>Order ID</th><th>Time</th><th>Items</th><th>Amount</th><th>Coupon</th><th>Customer</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="8" style="text-align:center;padding:40px;color:#64748b">No orders yet</td></tr>'}</tbody>
@@ -225,7 +256,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
     order = await r.json();
   } catch (e) { error = e.message; }
 
-  if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${error}</p>`);
+  if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
   const success = req.query.saved === "1" ? `<div class="ok">✓ Order updated successfully.</div>` : "";
   const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
@@ -249,32 +280,32 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       .row.items .item{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dashed #334155}
       .row.items .item:last-child{border:none}
       label{display:block;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
-      select,textarea{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;font-size:14px;font-family:inherit;outline:none}
+      select,textarea,input[type=text],input[type=number]{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box}
       textarea{min-height:120px;font-family:'DM Mono',monospace,Courier;resize:vertical}
-      select:focus,textarea:focus{border-color:#f87171}
+      select:focus,textarea:focus,input:focus{border-color:#f87171}
       .btn{display:inline-block;padding:11px 22px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
       .btn:hover{background:#b91c1c}
       .ok{background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px}
       small{color:#64748b;font-size:12px}
     </style></head><body>
     <a class="back" href="/admin">← Back to all orders</a>
-    <h1>Manage Order: <code>${order.order_id}</code></h1>
+    <h1>Manage Order: <code>${escapeHtml(order.order_id)}</code></h1>
     ${success}${emailed}
     <div class="card">
       <div class="row"><span>Status</span><span>${statusBadgeHtml(order.status)}</span></div>
       <div class="row"><span>Placed</span><span>${new Date(order.ts).toLocaleString()}</span></div>
       ${order.paid_at ? `<div class="row"><span>Paid at</span><span>${new Date(order.paid_at).toLocaleString()}</span></div>` : ""}
       <div class="row"><span>Amount</span><span><strong>LKR ${order.amount}</strong></span></div>
-      ${order.coupon_code ? `<div class="row"><span>Coupon</span><span>${order.coupon_code}</span></div>` : ""}
-      <div class="row"><span>Customer</span><span>${order.customer?.first_name || ""} ${order.customer?.last_name || ""}</span></div>
-      <div class="row"><span>Email</span><span>${order.customer?.email || "—"}</span></div>
-      <div class="row"><span>Phone</span><span>${order.customer?.phone || "—"}</span></div>
+      ${order.coupon_code ? `<div class="row"><span>Coupon</span><span>${escapeHtml(order.coupon_code)}</span></div>` : ""}
+      <div class="row"><span>Customer</span><span>${escapeHtml(order.customer?.first_name || "")} ${escapeHtml(order.customer?.last_name || "")}</span></div>
+      <div class="row"><span>Email</span><span>${escapeHtml(order.customer?.email || "—")}</span></div>
+      <div class="row"><span>Phone</span><span>${escapeHtml(order.customer?.phone || "—")}</span></div>
     </div>
 
     <div class="card">
       <strong>Items</strong>
       <div class="row items" style="margin-top:8px">
-        ${items.map(it => `<div class="item"><span>${it.name}</span><span>×${it.quantity || it.qty || 1}</span></div>`).join("")}
+        ${items.map(it => `<div class="item"><span>${escapeHtml(it.name)}</span><span>×${it.quantity || it.qty || 1}</span></div>`).join("")}
       </div>
     </div>
 
@@ -290,7 +321,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       </select>
 
       <label for="product_keys">Product Keys <small>(one per line — visible to customer when status is Completed)</small></label>
-      <textarea name="product_keys" id="product_keys" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX">${keysText}</textarea>
+      <textarea name="product_keys" id="product_keys" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX">${escapeHtml(keysText)}</textarea>
 
       <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
         💡 Setting status to <strong>Completed</strong> will automatically email the customer their keys.
@@ -311,7 +342,6 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
   const product_keys = keysRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 
   try {
-    // Fetch the previous order so we can detect a transition into Completed
     let previous = null;
     try {
       const r = await workerFetch(`/orders/get/${encodeURIComponent(order_id)}`);
@@ -320,7 +350,6 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
 
     await updateOrderInKV({ order_id, status, product_keys });
 
-    // Auto-email customer ONLY when status moves into "Completed" with keys present
     let emailed = false;
     const becameCompleted = status === "Completed" && (!previous || previous.status !== "Completed");
     if (becameCompleted && product_keys.length > 0 && previous?.customer?.email && ORDER_EMAIL_TOKEN) {
@@ -353,7 +382,185 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
 
     res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1${emailed ? "&emailed=1" : ""}`);
   } catch (e) {
-    res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${e.message} <a href="/admin/order/${encodeURIComponent(order_id)}">← Try again</a></p>`);
+    res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${escapeHtml(e.message)} <a href="/admin/order/${encodeURIComponent(order_id)}">← Try again</a></p>`);
+  }
+});
+
+// ===== Admin: list service requests =====
+app.get("/admin/services", requireAdmin, async (req, res) => {
+  let all = [], fetchError = null;
+  try {
+    const r = await workerFetch("/services/list?limit=500");
+    const data = await r.json();
+    all = data.services || [];
+  } catch (e) { fetchError = e.message; }
+
+  const rows = all.map(s => `
+    <tr>
+      <td><a href="/admin/service/${encodeURIComponent(s.service_id)}" style="color:#f87171;text-decoration:none"><code>${escapeHtml(s.service_id)}</code></a></td>
+      <td>${new Date(s.ts).toLocaleString()}</td>
+      <td>${escapeHtml(s.customer?.first_name || "")} ${escapeHtml(s.customer?.last_name || "")}<br>
+          <small style="color:#94a3b8">${escapeHtml(s.customer?.email || "")}<br>${escapeHtml(s.customer?.phone || "")}</small></td>
+      <td>${escapeHtml(s.service_type || "—")}</td>
+      <td><small style="color:#cbd5e1;line-height:1.4">${escapeHtml((s.description || "").slice(0, 90))}${(s.description || "").length > 90 ? "…" : ""}</small></td>
+      <td>${serviceBadgeHtml(s.status)}</td>
+      <td><a href="/admin/service/${encodeURIComponent(s.service_id)}" style="background:#dc2626;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:700">Manage</a></td>
+    </tr>`).join("");
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>RedTrex Service Requests</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0}
+      .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px}
+      h1{color:#f87171;margin:0}
+      .logout{background:#334155;color:#e2e8f0;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:13px;border:1px solid #475569}
+      .logout:hover{background:#475569}
+      .err{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px}
+      table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden}
+      th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #334155;font-size:13px;vertical-align:top}
+      th{background:#0f172a;color:#94a3b8;text-transform:uppercase;font-size:11px}
+      tr:hover td{background:#283548}
+      code{background:#0f172a;padding:2px 6px;border-radius:4px;font-size:11px}
+    </style></head><body>
+    ${adminTabsHtml("services")}
+    <div class="head">
+      <h1>🛠️ Service Requests <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
+      <div style="display:flex;gap:8px">
+        <form method="POST" action="/admin/services/seed-test" style="margin:0">
+          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Create Test Request</button>
+        </form>
+        <a class="logout" href="/logout">Sign Out</a>
+      </div>
+    </div>
+    ${fetchError ? `<div class="err">⚠ Could not reach Cloudflare KV: ${escapeHtml(fetchError)}</div>` : ""}
+    <table>
+      <thead><tr><th>Reference</th><th>Submitted</th><th>Customer</th><th>Service</th><th>Description</th><th>Status</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#64748b">No service requests yet</td></tr>'}</tbody>
+    </table></body></html>`);
+});
+
+// ===== Admin: create test service request =====
+app.post("/admin/services/seed-test", requireAdmin, async (req, res) => {
+  // Use the public create endpoint so the worker generates a real SVC-ID
+  try {
+    const r = await fetch(`${ORDERS_WORKER_URL}/services/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        first_name: "Test",
+        last_name: "Customer",
+        email: "test@redtrex.com",
+        phone: "+94712622012",
+        service_type: "IT Support",
+        description: "This is a seeded test request to verify the admin workflow end-to-end."
+      })
+    });
+    const data = await r.json();
+    if (!data.created) return res.status(500).send("Seed failed: " + JSON.stringify(data));
+    res.redirect(`/admin/service/${encodeURIComponent(data.service_id)}?saved=1`);
+  } catch (e) {
+    res.status(500).send("Seed error: " + escapeHtml(e.message));
+  }
+});
+
+// ===== Admin: single service request edit page =====
+app.get("/admin/service/:id", requireAdmin, async (req, res) => {
+  let svc = null, error = null;
+  try {
+    const r = await workerFetch(`/services/get/${encodeURIComponent(req.params.id)}`);
+    if (r.status === 404) {
+      return res.status(404).send(`<p style="font-family:system-ui;padding:30px;color:#fff;background:#0f172a">Request not found. <a href="/admin/services" style="color:#f87171">← Back</a></p>`);
+    }
+    svc = await r.json();
+  } catch (e) { error = e.message; }
+
+  if (!svc) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
+
+  const success = req.query.saved === "1" ? `<div class="ok">✓ Request updated successfully.</div>` : "";
+  const statusOpts = SERVICE_STATUSES.map(s =>
+    `<option value="${s}" ${svc.status === s ? "selected" : ""}>${s}</option>`
+  ).join("");
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Manage Service Request</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0 auto;max-width:760px}
+      a.back{color:#f87171;text-decoration:none;font-size:13px;display:inline-block;margin-bottom:14px}
+      h1{font-size:22px;margin:0 0 10px;color:#f87171}
+      h1 code{font-family:monospace;font-size:16px;color:#e2e8f0;background:#1e293b;padding:4px 8px;border-radius:4px}
+      .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px}
+      .row{display:flex;justify-content:space-between;padding:6px 0;font-size:14px;gap:14px}
+      .row span:first-child{color:#94a3b8;flex-shrink:0}
+      .row span:last-child{text-align:right;word-break:break-word}
+      .desc-box{background:#0f172a;border:1px solid #334155;border-radius:6px;padding:12px;margin-top:8px;white-space:pre-wrap;font-size:14px;line-height:1.55}
+      label{display:block;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
+      select,textarea,input[type=text],input[type=number]{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box}
+      textarea{min-height:100px;resize:vertical}
+      select:focus,textarea:focus,input:focus{border-color:#f87171}
+      .btn{display:inline-block;padding:11px 22px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
+      .btn:hover{background:#b91c1c}
+      .ok{background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px}
+      small{color:#64748b;font-size:12px}
+    </style></head><body>
+    <a class="back" href="/admin/services">← Back to all requests</a>
+    <h1>Service Request: <code>${escapeHtml(svc.service_id)}</code></h1>
+    ${success}
+    <div class="card">
+      <div class="row"><span>Status</span><span>${serviceBadgeHtml(svc.status)}</span></div>
+      <div class="row"><span>Submitted</span><span>${new Date(svc.ts).toLocaleString()}</span></div>
+      ${svc.updated_at ? `<div class="row"><span>Updated</span><span>${new Date(svc.updated_at).toLocaleString()}</span></div>` : ""}
+      <div class="row"><span>Customer</span><span>${escapeHtml(svc.customer?.first_name || "")} ${escapeHtml(svc.customer?.last_name || "")}</span></div>
+      <div class="row"><span>Email</span><span>${escapeHtml(svc.customer?.email || "—")}</span></div>
+      <div class="row"><span>Phone</span><span>${escapeHtml(svc.customer?.phone || "—")}</span></div>
+      <div class="row"><span>Service Type</span><span><strong>${escapeHtml(svc.service_type || "—")}</strong></span></div>
+      ${svc.preferred_date ? `<div class="row"><span>Preferred</span><span>${escapeHtml(svc.preferred_date)}</span></div>` : ""}
+      ${svc.location ? `<div class="row"><span>Location</span><span>${escapeHtml(svc.location)}</span></div>` : ""}
+    </div>
+
+    <div class="card">
+      <strong>Description from customer</strong>
+      <div class="desc-box">${escapeHtml(svc.description || "—")}</div>
+    </div>
+
+    <form class="card" method="POST" action="/admin/service/${encodeURIComponent(svc.service_id)}">
+      <strong style="font-size:16px">Update Request</strong>
+
+      <label for="status">Status</label>
+      <select name="status" id="status">${statusOpts}</select>
+
+      <label for="scheduled_for">Scheduled For <small>(free text — visible to customer)</small></label>
+      <input type="text" name="scheduled_for" id="scheduled_for" value="${escapeHtml(svc.scheduled_for || "")}" placeholder="e.g. Saturday 2026-05-10 at 2:00 PM">
+
+      <label for="quote_amount">Quote Amount (LKR) <small>(optional — shown on tracking page when &gt; 0)</small></label>
+      <input type="number" name="quote_amount" id="quote_amount" min="0" step="0.01" value="${Number(svc.quote_amount) || 0}">
+
+      <label for="admin_note">Note to Customer <small>(visible on the tracking page)</small></label>
+      <textarea name="admin_note" id="admin_note" placeholder="e.g. We'll arrive Saturday 2pm. Please back up your data first.">${escapeHtml(svc.admin_note || "")}</textarea>
+
+      <p style="margin:12px 0 0;font-size:13px;color:#94a3b8">
+        💡 The customer can see your status, schedule, quote and note on the tracking page.
+      </p>
+
+      <div style="margin-top:16px">
+        <button class="btn" type="submit">Save Changes</button>
+      </div>
+    </form>
+  </body></html>`);
+});
+
+// Save service request updates from admin
+app.post("/admin/service/:id", requireAdmin, async (req, res) => {
+  const service_id = req.params.id;
+  const status = (req.body.status || "").toString();
+  const admin_note = (req.body.admin_note || "").toString();
+  const scheduled_for = (req.body.scheduled_for || "").toString();
+  const quote_amount = Number(req.body.quote_amount) || 0;
+
+  try {
+    await updateServiceInKV({ service_id, status, admin_note, scheduled_for, quote_amount });
+    res.redirect(`/admin/service/${encodeURIComponent(service_id)}?saved=1`);
+  } catch (e) {
+    res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${escapeHtml(e.message)} <a href="/admin/service/${encodeURIComponent(service_id)}">← Try again</a></p>`);
   }
 });
 
@@ -367,6 +574,19 @@ app.get("/orders", requireAdmin, async (req, res) => {
 app.get("/orders/:id", requireAdmin, async (req, res) => {
   try {
     const r = await workerFetch(`/orders/get/${encodeURIComponent(req.params.id)}`);
+    if (r.status === 404) return res.status(404).json({ error: "Not found" });
+    res.json(await r.json());
+  } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
+});
+app.get("/services", requireAdmin, async (req, res) => {
+  try {
+    const r = await workerFetch("/services/list?limit=200");
+    res.json(await r.json());
+  } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
+});
+app.get("/services/:id", requireAdmin, async (req, res) => {
+  try {
+    const r = await workerFetch(`/services/get/${encodeURIComponent(req.params.id)}`);
     if (r.status === 404) return res.status(404).json({ error: "Not found" });
     res.json(await r.json());
   } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
