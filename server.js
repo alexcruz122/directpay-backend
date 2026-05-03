@@ -74,10 +74,10 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// ===== Helpers for status normalization =====
+// ===== Helpers =====
 function normalizeStatus(raw) {
   const s = (raw || "").toString().toUpperCase();
-  if (s === "SUCCESS" || s === "PAID") return "Pending";   // payment confirmed, awaiting fulfillment
+  if (s === "SUCCESS" || s === "PAID") return "Pending";
   if (s === "FAILED" || s === "CANCELED" || s === "CANCELLED") return "Cancelled";
   if (s === "REFUNDED") return "Refunded";
   if (s === "COMPLETED") return "Completed";
@@ -172,13 +172,44 @@ app.get("/admin", requireAdmin, async (req, res) => {
     </style></head><body>
     <div class="head">
       <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
-      <a class="logout" href="/logout">Sign Out</a>
+      <div style="display:flex;gap:8px">
+        <form method="POST" action="/admin/seed-test" style="margin:0">
+          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Create Test Order</button>
+        </form>
+        <a class="logout" href="/logout">Sign Out</a>
+      </div>
     </div>
     ${fetchError ? `<div class="err">⚠ Could not reach Cloudflare KV: ${fetchError}</div>` : ""}
     <table>
       <thead><tr><th>Order ID</th><th>Time</th><th>Items</th><th>Amount</th><th>Coupon</th><th>Customer</th><th>Status</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="8" style="text-align:center;padding:40px;color:#64748b">No orders yet</td></tr>'}</tbody>
     </table></body></html>`);
+});
+
+// ===== Admin: create test order =====
+app.post("/admin/seed-test", requireAdmin, async (req, res) => {
+  const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
+  const order_id = `ORD-TEST-${rand}`;
+  const testOrder = {
+    ts: Date.now(),
+    order_id,
+    amount: 4500,
+    items: [
+      { name: "Windows 11 Pro (TEST)", quantity: 1 },
+      { name: "EaseUS Data Recovery (TEST)", quantity: 1 }
+    ],
+    coupon_code: "TESTCOUPON10",
+    customer: {
+      first_name: "Test",
+      last_name: "Customer",
+      email: "test@redtrex.com",
+      phone: "+94712622012"
+    },
+    status: "Pending"
+  };
+  await saveOrderToKV(testOrder);
+  console.log(`[seed-test] created ${order_id}`);
+  res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1`);
 });
 
 // ===== Admin: single order edit page =====
@@ -204,7 +235,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Manage Order</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
-      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0;max-width:760px;margin:0 auto}
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0 auto;max-width:760px}
       a.back{color:#f87171;text-decoration:none;font-size:13px;display:inline-block;margin-bottom:14px}
       h1{font-size:22px;margin:0 0 10px;color:#f87171}
       h1 code{font-family:monospace;font-size:16px;color:#e2e8f0;background:#1e293b;padding:4px 8px;border-radius:4px}
@@ -330,7 +361,6 @@ app.post("/callback", async (req, res) => {
   if (receivedSignature !== generatedSignature) return res.status(403).send("Invalid signature");
 
   const { order_id, amount, status } = req.body;
-  // Normalize DirectPay status: SUCCESS keeps order in "Pending" (paid, awaiting fulfillment); FAILED → Cancelled
   const normalized = normalizeStatus(status);
   await saveOrderToKV({ order_id, status: normalized, paid_amount: amount, paid_at: Date.now() });
   console.log(`[callback] ${order_id} | ${status} → ${normalized} | LKR ${amount}`);
