@@ -25,11 +25,37 @@ app.post("/create-payment", (req, res) => {
     first_name = "",
     last_name = "",
     email = "",
-    phone = ""
+    phone = "",
+    product_name = "",
+    qty = 1,
+    items // optional: array of { name, quantity, price }
   } = req.body;
 
   if (!order_id || !amount) {
     return res.status(400).json({ error: "Missing order_id or amount" });
+  }
+
+  // Build a human-readable description + structured line items for DirectPay
+  let description;
+  let itemsArray;
+
+  if (Array.isArray(items) && items.length > 0) {
+    itemsArray = items.map(it => ({
+      name: String(it.name || "Item").slice(0, 100),
+      quantity: Number(it.quantity || it.qty || 1),
+      price: Number(it.price || it.unitPrice || 0)
+    }));
+    description = itemsArray
+      .map(it => `${it.name} x${it.quantity}`)
+      .join(", ")
+      .slice(0, 250);
+  } else {
+    itemsArray = [{
+      name: String(product_name || "RedTrex Order").slice(0, 100),
+      quantity: Number(qty) || 1,
+      price: Number(amount)
+    }];
+    description = `${itemsArray[0].name} x${itemsArray[0].quantity}`;
   }
 
   const payload = {
@@ -42,6 +68,9 @@ app.post("/create-payment", (req, res) => {
     last_name,
     email,
     phone,
+    description,                   // shown in DirectPay dashboard
+    product_description: description, // alternate key some DirectPay accounts use
+    items: itemsArray,             // structured line items
     response_url: "https://www.api.redtrex.store/callback"
   };
 
@@ -82,7 +111,7 @@ app.post("/callback", (req, res) => {
   const { order_id, amount, status } = req.body;
 
   const redirectUrl =
-  `https://www.redtrex.store/payment-success?order_id=${encodeURIComponent(order_id)}&amount=${encodeURIComponent(amount)}&status=${encodeURIComponent(status)}`;
+    `https://www.redtrex.store/payment-success?order_id=${encodeURIComponent(order_id)}&amount=${encodeURIComponent(amount)}&status=${encodeURIComponent(status)}`;
 
   res.redirect(redirectUrl);
 
