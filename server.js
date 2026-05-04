@@ -89,6 +89,24 @@ async function adminCreateServiceInKV(payload) {
   return res.json();
 }
 
+// ===== Service email helper =====
+async function sendServiceEmail(type, data) {
+  if (!ORDER_EMAIL_TOKEN || !EMAIL_WORKER_URL) {
+    console.log("[service-email] skipped — EMAIL_WORKER_URL or ORDER_EMAIL_TOKEN not set");
+    return false;
+  }
+  try {
+    const res = await fetch(`${EMAIL_WORKER_URL}/send-service-email`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${ORDER_EMAIL_TOKEN}` },
+      body: JSON.stringify({ type, ...data })
+    });
+    if (!res.ok) { console.error(`[service-email] failed (${res.status}):`, await res.text()); return false; }
+    console.log(`[service-email] ${type} sent to ${data.to} for ${data.service_id}`);
+    return true;
+  } catch (e) { console.error("[service-email] error:", e.message); return false; }
+}
+
 // ===== Auth middleware =====
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(503).json({ error: "Admin endpoint disabled" });
@@ -558,7 +576,22 @@ app.post("/admin/services/new", requireAdmin, async (req, res) => {
     };
     const result = await adminCreateServiceInKV(payload);
     console.log(`[admin] created service ${result.service_id} for ${payload.email}`);
-    res.redirect(`/admin/service/${encodeURIComponent(result.service_id)}?saved=1&newsvc=1`);
+
+    let emailed = false;
+    if (payload.email) {
+      emailed = await sendServiceEmail("created", {
+        to: payload.email,
+        customer_name: `${payload.first_name || ""} ${payload.last_name || ""}`.trim() || "Customer",
+        service_id: result.service_id,
+        service_type: payload.service_type,
+        description: payload.description,
+        status: payload.status || "Pending",
+        admin_note: payload.admin_note || "",
+        scheduled_for: payload.scheduled_for || "",
+        quote_amount: payload.quote_amount || 0
+      });
+    }
+    res.redirect(`/admin/service/${encodeURIComponent(result.service_id)}?saved=1&newsvc=1${emailed ? "&emailed=1" : ""}`);
   } catch (e) {
     res.redirect(`/admin/services/new?err=${encodeURIComponent(e.message)}`);
   }
@@ -576,6 +609,7 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
   if (!svc) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
   const success = req.query.saved === "1" ? `<div class="ok">✓ Request updated successfully.</div>` : "";
+  const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
   const newSvc  = req.query.newsvc === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📬 Share these with the customer:<br><strong>SVC-ID:</strong> <code>${escapeHtml(svc.service_id)}</code><br><strong>Email:</strong> <code>${escapeHtml(svc.customer?.email || "")}</code><br>Tracking page: <a href="https://www.redtrex.com.lk/track-service" style="color:#a5b4fc">redtrex.com.lk/track-service</a></div>` : "";
   const delerr  = req.query.delerr === "1" ? `<div class="err" style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ You must type <code>DELETE</code> to confirm deletion.</div>` : "";
   const statusOpts = SERVICE_STATUSES.map(s => `<option value="${s}" ${svc.status === s ? "selected" : ""}>${s}</option>`).join("");
@@ -603,7 +637,7 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
     </style></head><body>
     <a class="back" href="/admin/services">← Back to all requests</a>
     <h1>Service Request: <code>${escapeHtml(svc.service_id)}</code></h1>
-    ${success}${newSvc}${delerr}
+    ${success}${emailed}${newSvc}${delerr}
     <div class="card">
       <div class="row"><span>Status</span><span>${serviceBadgeHtml(svc.status)}</span></div>
       <div class="row"><span>Submitted</span><span>${new Date(svc.ts).toLocaleString()}${svc.created_by === "admin" ? ' <small style="color:#a5b4fc">(by admin)</small>' : ""}</span></div>
@@ -647,8 +681,31 @@ app.post("/admin/service/:id", requireAdmin, async (req, res) => {
   const quote_amount = Number(req.body.quote_amount) || 0;
 
   try {
+    let previous = null;
+    try {
+      const r = await workerFetch(`/services/get/${encodeURIComponent(service_id)}`);
+      if (r.ok) previous = await r.json();
+    } catch (_) {}
+
     await updateServiceInKV({ service_id, status, admin_note, scheduled_for, quote_amount });
-    res.redirect(`/admin/service/${encodeURIComponent(service_id)}?saved=1`);
+
+    let emailed = false;
+    const statusChanged = previous && previous.status !== status;
+    if (statusChanged && previous?.customer?.email) {
+      emailed = await sendServiceEmail("updated", {
+        to: previous.customer.email,
+        customer_name: `${previous.customer.first_name || ""} ${previous.customer.last_name || ""}`.trim() || "Customer",
+        service_id,
+        service_type: previous.service_type || "",
+        status,
+        previous_status: previous.status,
+        admin_note: admin_note || "",
+        scheduled_for: scheduled_for || "",
+        quote_amount
+      });
+    }
+
+    res.redirect(`/admin/service/${encodeURIComponent(service_id)}?saved=1${emailed ? "&emailed=1" : ""}`);
   } catch (e) {
     res.status(500).send(`<p style="color:red;font-family:system-ui;padding:24px">Update failed: ${escapeHtml(e.message)} <a href="/admin/service/${encodeURIComponent(service_id)}">← Try again</a></p>`);
   }
