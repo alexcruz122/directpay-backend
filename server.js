@@ -49,7 +49,9 @@ const ALLOWED_ORIGINS = new Set([
   "https://www.redtrex.com.lk",
   "https://redtrex.com.lk",
   "https://www.redtrex.store",
-  "https://redtrex.store"
+  "https://redtrex.store",
+  "https://api.redtrex.store",
+  "https://www.api.redtrex.store"
 ]);
 app.use(cors({
   origin(origin, cb) {
