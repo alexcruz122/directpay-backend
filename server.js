@@ -55,11 +55,14 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin(origin, cb) {
-    // Allow non-browser tools (no Origin header) so your own server-to-server
-    // calls keep working, but block any cross-site browser request.
+    // No Origin header (server-to-server, curl, same-origin form POST in some
+    // browsers): allow. Known origin: allow. Unknown: don't add CORS headers
+    // (browser will block the response) but DON'T throw — throwing turns every
+    // request into a 500 and breaks the admin pages themselves.
     if (!origin) return cb(null, true);
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
-    return cb(new Error("CORS blocked"), false);
+    console.warn("[cors] blocked origin:", origin);
+    return cb(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "OPTIONS"]
