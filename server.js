@@ -467,10 +467,11 @@ app.get("/admin", requireAdmin, async (req, res) => {
     ${deleted}
     <div class="head">
       <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <a href="/admin/orders/new" style="background:#dc2626;color:#fff;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:700">+ New Manual Order</a>
         <form method="POST" action="/admin/seed-test" style="margin:0">
           ${csrfFieldHtml(sid)}
-          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Create Test Order</button>
+          <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Test Order</button>
         </form>
         <a class="logout" href="/logout">Sign Out</a>
       </div>
@@ -497,6 +498,152 @@ app.post("/admin/seed-test", requireAdmin, requireCsrf, async (req, res) => {
   });
   console.log(`[seed-test] created ${order_id}`);
   res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1`);
+});
+
+// =============================================================================
+// Admin: NEW manual order form (for bank transfers, crypto, QR pay, etc.)
+// =============================================================================
+app.get("/admin/orders/new", requireAdmin, (req, res) => {
+  const sid = req._sid;
+  const err = req.query.err ? `<div style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ ${escapeHtml(req.query.err)}</div>` : "";
+  const methods = ["Bank Transfer", "Bybit Pay", "Binance Pay", "QR Pay", "Cash", "Card", "Other"];
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>New Manual Order</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0 auto;max-width:760px}
+      a.back{color:#f87171;text-decoration:none;font-size:13px;display:inline-block;margin-bottom:14px}
+      h1{font-size:22px;margin:0 0 14px;color:#f87171}
+      .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:16px}
+      label{display:block;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;font-weight:600}
+      input,select,textarea{width:100%;padding:10px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;font-size:14px;font-family:inherit;outline:none;box-sizing:border-box}
+      textarea{min-height:90px;resize:vertical}
+      input:focus,select:focus,textarea:focus{border-color:#f87171}
+      .btn{display:inline-block;padding:11px 22px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-weight:700;font-size:14px;cursor:pointer;text-transform:uppercase;letter-spacing:.5px}
+      .btn:hover{background:#b91c1c}
+      .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+      @media(max-width:600px){.grid{grid-template-columns:1fr}}
+      small{color:#64748b;font-size:12px}
+    </style></head><body>
+    <a class="back" href="/admin">← Back to all orders</a>
+    <h1>➕ Create Manual Order</h1>
+    ${err}
+    <p style="color:#94a3b8;font-size:14px;margin:0 0 16px">Use this when a customer pays you directly (bank transfer, Bybit/Binance, QR, cash). Record the payment reference so it's traceable, then deliver the keys when ready.</p>
+    <form class="card" method="POST" action="/admin/orders/new">
+      ${csrfFieldHtml(sid)}
+
+      <strong style="font-size:15px">Customer</strong>
+      <div class="grid">
+        <div><label>First Name *</label><input name="first_name" required maxlength="60"></div>
+        <div><label>Last Name *</label><input name="last_name" required maxlength="60"></div>
+      </div>
+      <div class="grid">
+        <div><label>Email *</label><input type="email" name="email" required maxlength="160"></div>
+        <div><label>Phone *</label><input name="phone" required maxlength="30" placeholder="+947..."></div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid #334155;margin:20px 0">
+      <strong style="font-size:15px">Order Items</strong>
+      <label>Product Name *</label>
+      <input name="product_name" required maxlength="200" placeholder="e.g. Windows 11 Pro">
+      <div class="grid">
+        <div><label>Quantity *</label><input type="number" name="qty" min="1" max="100" value="1" required></div>
+        <div><label>Total Amount (LKR) *</label><input type="number" name="amount" min="10" max="500000" step="0.01" required placeholder="e.g. 4500"></div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid #334155;margin:20px 0">
+      <strong style="font-size:15px">Payment</strong>
+      <div class="grid">
+        <div><label>Payment Method *</label><select name="payment_method" required>${methods.map(m => `<option value="${m}">${m}</option>`).join("")}</select></div>
+        <div><label>Payment Reference / TXID *</label><input name="payment_reference" required maxlength="200" placeholder="Bank ref / Tx hash / Slip #"></div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid #334155;margin:20px 0">
+      <strong style="font-size:15px">Fulfillment</strong>
+      <div class="grid">
+        <div><label>Initial Status</label><select name="status">
+          <option value="Pending" selected>Pending (payment confirmed, keys not yet sent)</option>
+          <option value="Completed">Completed (keys ready to email)</option>
+          <option value="Cancelled">Cancelled</option>
+          <option value="Refunded">Refunded</option>
+        </select></div>
+        <div><label>Coupon Used <small>(optional)</small></label><input name="coupon_code" maxlength="50" placeholder="—"></div>
+      </div>
+      <label>Product Keys <small>(one per line — only sent if status is Completed)</small></label>
+      <textarea name="product_keys" placeholder="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX" style="font-family:'DM Mono',monospace,Courier"></textarea>
+      <label>Admin Note <small>(internal — not visible to customer)</small></label>
+      <textarea name="admin_note" placeholder="e.g. Bank slip received via WhatsApp 2026-05-05"></textarea>
+
+      <div style="margin-top:18px"><button class="btn" type="submit">Create Order</button></div>
+    </form>
+  </body></html>`);
+});
+
+app.post("/admin/orders/new", requireAdmin, requireCsrf, async (req, res) => {
+  try {
+    const b = safeClone(req.body);
+    const first_name = String(b.first_name || "").slice(0, 60).trim();
+    const last_name  = String(b.last_name  || "").slice(0, 60).trim();
+    const email      = String(b.email      || "").slice(0, 160).trim();
+    const phone      = String(b.phone      || "").slice(0, 30).trim();
+    const product_name = String(b.product_name || "").slice(0, MAX_ITEM_NAME).trim();
+    const qty = Math.max(1, Math.min(100, Number(b.qty) || 1));
+    const amount = Number(b.amount);
+    const payment_method = String(b.payment_method || "Other").slice(0, 50);
+    const payment_reference = String(b.payment_reference || "").slice(0, 200).trim();
+    const coupon_code = b.coupon_code ? String(b.coupon_code).slice(0, 50).trim() : null;
+    const status = ["Pending", "Completed", "Cancelled", "Refunded"].includes(b.status) ? b.status : "Pending";
+    const admin_note = String(b.admin_note || "").slice(0, 2000);
+    const keysRaw = String(b.product_keys || "");
+    const product_keys = keysRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+    if (!first_name || !last_name) throw new Error("Name required");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Valid email required");
+    if (phone.length < 7) throw new Error("Valid phone required");
+    if (!product_name) throw new Error("Product name required");
+    if (!Number.isFinite(amount) || amount < MIN_AMOUNT_LKR || amount > MAX_AMOUNT_LKR)
+      throw new Error(`Amount must be between LKR ${MIN_AMOUNT_LKR} and LKR ${MAX_AMOUNT_LKR}`);
+    if (!payment_reference) throw new Error("Payment reference required");
+
+    const order_id = `ORD-MAN-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+    const order = {
+      ts: Date.now(), order_id, amount, product_name, qty,
+      items: [{ name: product_name, quantity: qty }],
+      coupon_code,
+      customer: { first_name, last_name, email, phone },
+      status,
+      payment_method,
+      payment_reference,
+      admin_note,
+      created_by: "admin",
+      paid_at: Date.now()
+    };
+    if (product_keys.length) order.product_keys = product_keys;
+
+    await saveOrderToKV(order);
+    console.log(`[admin] manual order ${order_id} | ${product_name} ×${qty} | LKR ${amount} | ${payment_method} ref=${payment_reference}`);
+
+    // Auto-email keys if Completed and keys provided
+    let emailed = false;
+    if (status === "Completed" && product_keys.length && email && ORDER_EMAIL_TOKEN) {
+      try {
+        const r = await fetch(`${EMAIL_WORKER_URL}/send-order-email`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${ORDER_EMAIL_TOKEN}` },
+          body: JSON.stringify({
+            to: email,
+            customer_name: `${first_name} ${last_name}`.trim(),
+            order_id, items: order.items, product_keys, amount
+          })
+        });
+        if (r.ok) { emailed = true; console.log(`[email] sent to ${email} for ${order_id}`); }
+        else console.error(`[email] failed (${r.status}):`, await r.text());
+      } catch (e) { console.error("[email] error:", e.message); }
+    }
+
+    res.redirect(`/admin/order/${encodeURIComponent(order_id)}?saved=1${emailed ? "&emailed=1" : ""}`);
+  } catch (e) {
+    res.redirect(`/admin/orders/new?err=${encodeURIComponent(e.message)}`);
+  }
 });
 
 app.get("/admin/order/:id", requireAdmin, async (req, res) => {
@@ -551,6 +698,10 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       <div class="row"><span>Customer</span><span>${escapeHtml(order.customer?.first_name || "")} ${escapeHtml(order.customer?.last_name || "")}</span></div>
       <div class="row"><span>Email</span><span>${escapeHtml(order.customer?.email || "—")}</span></div>
       <div class="row"><span>Phone</span><span>${escapeHtml(order.customer?.phone || "—")}</span></div>
+      ${order.payment_method ? `<div class="row"><span>Payment Method</span><span><strong>${escapeHtml(order.payment_method)}</strong></span></div>` : ""}
+      ${order.payment_reference ? `<div class="row"><span>Payment Reference</span><span><code style="background:#0f172a;padding:2px 8px;border-radius:4px;font-size:12px">${escapeHtml(order.payment_reference)}</code></span></div>` : ""}
+      ${order.admin_note ? `<div class="row"><span>Admin Note</span><span style="white-space:pre-wrap;text-align:right">${escapeHtml(order.admin_note)}</span></div>` : ""}
+      ${order.created_by === "admin" ? `<div class="row"><span>Created By</span><span style="color:#a5b4fc">Admin (manual)</span></div>` : ""}
     </div>
 
     <div class="card">
