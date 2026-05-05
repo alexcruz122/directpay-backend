@@ -1,8 +1,22 @@
 // =============================================================================
-// RedTrex Render Backend (api.redtrex.store)
+// RedTrex Render Backend (api.redtrex.store) — HARDENED
 // -----------------------------------------------------------------------------
 // IMPORTANT: This file is for your RENDER service repo, NOT for this Replit
 // project. The local /server.js in this Replit just serves static HTML pages.
+//
+// Security hardening applied:
+//   - CORS allowlist (no wildcard)
+//   - Body size limits
+//   - Helmet-style security headers
+//   - HTTPS redirect (trust proxy)
+//   - Per-IP rate limiting on /login and /create-payment
+//   - Login lockout after repeated failures
+//   - Constant-time token comparison
+//   - Random session IDs (cookie no longer holds the raw admin token)
+//   - CSRF tokens on every admin POST form
+//   - Server-generated order_id (cannot be supplied or overwritten by client)
+//   - Amount/item bounds checking, prototype-pollution stripping
+//   - No ?token= URL-string admin auth (was leaking via referer/logs)
 // =============================================================================
 
 import express from "express";
@@ -10,9 +24,68 @@ import crypto from "crypto";
 import cors from "cors";
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(cors());
+// Trust the immediate proxy hop only. We additionally derive the real client IP
+// via clientIp() below (prefers Cloudflare's cf-connecting-ip, then the
+// rightmost X-Forwarded-For entry — the leftmost is attacker-controllable).
+app.set("trust proxy", 1);
+
+function clientIp(req) {
+  const cf = req.headers["cf-connecting-ip"];
+  if (cf) return String(cf).trim();
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const parts = String(xff).split(",").map(s => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1]; // rightmost = closest to us
+  }
+  return req.socket?.remoteAddress || req.ip || "unknown";
+}
+
+// ----- Body parsers with strict size limits -----
+app.use(express.json({ limit: "20kb" }));
+app.use(express.urlencoded({ extended: true, limit: "20kb" }));
+
+// ----- CORS allowlist -----
+const ALLOWED_ORIGINS = new Set([
+  "https://www.redtrex.com.lk",
+  "https://redtrex.com.lk",
+  "https://www.redtrex.store",
+  "https://redtrex.store"
+]);
+app.use(cors({
+  origin(origin, cb) {
+    // Allow non-browser tools (no Origin header) so your own server-to-server
+    // calls keep working, but block any cross-site browser request.
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked"), false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS"]
+}));
+
+// ----- Security headers (Helmet-equivalent, no extra dep) -----
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  // Admin pages render their own inline CSS, so allow inline styles for self.
+  res.setHeader("Content-Security-Policy",
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  next();
+});
+
+// ----- Force HTTPS in production -----
+app.use((req, res, next) => {
+  const proto = req.headers["x-forwarded-proto"];
+  if (proto && proto !== "https") {
+    return res.redirect(301, `https://${req.headers.host}${req.url}`);
+  }
+  next();
+});
 
 const {
   DIRECTPAY_MERCHANT_ID,
@@ -25,11 +98,67 @@ const {
 } = process.env;
 
 const COOKIE_NAME = "rt_admin";
-const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7;
+const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7; // 7 days
 const SERVICE_STATUSES = ["Pending", "Reviewing", "Scheduled", "In Progress", "Completed", "Cancelled"];
 const SERVICE_TYPES = ["Software Installation", "Activation Help", "Data Recovery", "IT Support", "PC Repair", "Network Setup", "Custom"];
 
-// ===== Cookie helpers =====
+// Bounds for /create-payment
+const MIN_AMOUNT_LKR = 10;
+const MAX_AMOUNT_LKR = 500000;
+const MAX_ITEMS = 20;
+const MAX_ITEM_NAME = 200;
+
+// =============================================================================
+// In-memory session store (random session IDs; cookie no longer holds raw token)
+// =============================================================================
+const sessions = new Map(); // sid -> { ip, exp }
+
+function createSession(ip) {
+  const sid = crypto.randomBytes(32).toString("hex");
+  const exp = Date.now() + COOKIE_MAX_AGE_SEC * 1000;
+  sessions.set(sid, { ip, exp });
+  return sid;
+}
+function isSessionValid(sid) {
+  if (!sid) return false;
+  const s = sessions.get(sid);
+  if (!s) return false;
+  if (s.exp < Date.now()) { sessions.delete(sid); return false; }
+  return true;
+}
+function destroySession(sid) { if (sid) sessions.delete(sid); }
+
+// Periodic cleanup
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, s] of sessions) if (s.exp < now) sessions.delete(sid);
+}, 60 * 60 * 1000);
+
+// =============================================================================
+// Rate limiter (sliding window per IP, in-memory)
+// =============================================================================
+function makeLimiter({ windowMs, max, key = req => clientIp(req) }) {
+  const buckets = new Map(); // key -> [timestamps]
+  return (req, res, next) => {
+    const k = key(req);
+    const now = Date.now();
+    const arr = (buckets.get(k) || []).filter(t => now - t < windowMs);
+    if (arr.length >= max) {
+      res.setHeader("Retry-After", Math.ceil(windowMs / 1000));
+      return res.status(429).send("Too many requests. Try again later.");
+    }
+    arr.push(now);
+    buckets.set(k, arr);
+    next();
+  };
+}
+const loginLimiter   = makeLimiter({ windowMs: 15 * 60 * 1000, max: 8 });
+const paymentLimiter = makeLimiter({ windowMs: 60 * 1000, max: 10 });
+const generalLimiter = makeLimiter({ windowMs: 60 * 1000, max: 60 });
+
+// =============================================================================
+// Cookie + CSRF helpers
+// =============================================================================
 function parseCookies(header = "") {
   const out = {};
   header.split(";").forEach(p => {
@@ -38,15 +167,32 @@ function parseCookies(header = "") {
   });
   return out;
 }
-function setAdminCookie(res, value) {
+function setAdminCookie(res, sid) {
   res.setHeader("Set-Cookie",
-    `${COOKIE_NAME}=${encodeURIComponent(value)}; Max-Age=${COOKIE_MAX_AGE_SEC}; Path=/; HttpOnly; Secure; SameSite=Lax`);
+    `${COOKIE_NAME}=${encodeURIComponent(sid)}; Max-Age=${COOKIE_MAX_AGE_SEC}; Path=/; HttpOnly; Secure; SameSite=Strict`);
 }
 function clearAdminCookie(res) {
-  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
+  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`);
 }
 
-// ===== Worker helpers =====
+// CSRF: HMAC of the session id
+const CSRF_SECRET = ADMIN_TOKEN || "boot"; // tied to the admin token
+function csrfToken(sid) {
+  return crypto.createHmac("sha256", CSRF_SECRET).update(sid).digest("hex").slice(0, 32);
+}
+function csrfFieldHtml(sid) {
+  return `<input type="hidden" name="_csrf" value="${csrfToken(sid)}">`;
+}
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// =============================================================================
+// Worker helpers
+// =============================================================================
 async function workerFetch(path, opts = {}) {
   return fetch(`${ORDERS_WORKER_URL}${path}`, {
     ...opts,
@@ -62,6 +208,14 @@ async function saveOrderToKV(order) {
     const res = await workerFetch("/orders/save", { method: "POST", body: JSON.stringify(order) });
     if (!res.ok) console.error(`[kv-save] failed (${res.status}):`, await res.text());
   } catch (e) { console.error("[kv-save] error:", e.message); }
+}
+async function getOrderFromKV(order_id) {
+  try {
+    const res = await workerFetch(`/orders/get/${encodeURIComponent(order_id)}`);
+    if (res.status === 404) return null;
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 async function updateOrderInKV(payload) {
   const res = await workerFetch("/orders/update", { method: "POST", body: JSON.stringify(payload) });
@@ -89,7 +243,9 @@ async function adminCreateServiceInKV(payload) {
   return res.json();
 }
 
-// ===== Service email helper =====
+// =============================================================================
+// Service email helper
+// =============================================================================
 async function sendServiceEmail(type, data) {
   if (!ORDER_EMAIL_TOKEN || !EMAIL_WORKER_URL) {
     console.log("[service-email] skipped — EMAIL_WORKER_URL or ORDER_EMAIL_TOKEN not set");
@@ -107,20 +263,43 @@ async function sendServiceEmail(type, data) {
   } catch (e) { console.error("[service-email] error:", e.message); return false; }
 }
 
-// ===== Auth middleware =====
+// =============================================================================
+// Auth middleware (cookie session OR header token for API tools)
+// =============================================================================
+function getSidFromReq(req) {
+  const cookies = parseCookies(req.headers.cookie || "");
+  return cookies[COOKIE_NAME] || "";
+}
 function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN) return res.status(503).json({ error: "Admin endpoint disabled" });
-  const cookies = parseCookies(req.headers.cookie || "");
-  const supplied = cookies[COOKIE_NAME] || req.query.token || req.headers["x-admin-token"];
-  if (supplied !== ADMIN_TOKEN) {
-    const wantsHtml = (req.headers.accept || "").includes("text/html");
-    if (wantsHtml) return res.redirect("/login");
-    return res.status(401).json({ error: "Unauthorized" });
+  const sid = getSidFromReq(req);
+  if (sid && isSessionValid(sid)) {
+    req._sid = sid;
+    return next();
+  }
+  // For programmatic API calls (curl/scripts), still allow header token
+  const headerToken = req.headers["x-admin-token"];
+  if (headerToken && safeEqual(headerToken, ADMIN_TOKEN)) {
+    req._sid = ""; // header auth = no CSRF needed
+    return next();
+  }
+  const wantsHtml = (req.headers.accept || "").includes("text/html");
+  if (wantsHtml) return res.redirect("/login");
+  return res.status(401).json({ error: "Unauthorized" });
+}
+function requireCsrf(req, res, next) {
+  // Header-token auth (no cookie) is exempt from CSRF
+  if (!req._sid) return next();
+  const supplied = (req.body && req.body._csrf) || req.headers["x-csrf-token"] || "";
+  if (!safeEqual(supplied, csrfToken(req._sid))) {
+    return res.status(403).send("Invalid or missing CSRF token. <a href='/admin'>← Back</a>");
   }
   next();
 }
 
-// ===== Helpers =====
+// =============================================================================
+// Helpers
+// =============================================================================
 function normalizeStatus(raw) {
   const s = (raw || "").toString().toUpperCase();
   if (s === "SUCCESS" || s === "PAID") return "Pending";
@@ -157,11 +336,12 @@ function adminTabsHtml(active) {
     `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
   return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tab("/admin","🛒 Orders",active==="orders")}${tab("/admin/services","🛠️ Service Requests",active==="services")}</div>`;
 }
-function dangerZoneFormHtml(action, label) {
+function dangerZoneFormHtml(action, label, sid) {
   return `
     <form class="card" method="POST" action="${action}"
       onsubmit="return confirm('Permanently delete this ${label}? This cannot be undone.')"
       style="border-color:#7f1d1d">
+      ${csrfFieldHtml(sid)}
       <strong style="font-size:16px;color:#f87171">⚠ Danger Zone</strong>
       <p style="color:#94a3b8;font-size:13px;margin:8px 0 12px">Type <code>DELETE</code> below to permanently remove this ${label} from KV.</p>
       <input name="confirm" placeholder="Type DELETE to confirm" required autocomplete="off"
@@ -170,12 +350,27 @@ function dangerZoneFormHtml(action, label) {
     </form>`;
 }
 
-// ===== Public root =====
+// Strip prototype-pollution keys from a flat object
+function safeClone(obj) {
+  const out = {};
+  for (const k of Object.keys(obj || {})) {
+    if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+    out[k] = obj[k];
+  }
+  return out;
+}
+
+// =============================================================================
+// Public root
+// =============================================================================
 app.get("/", (req, res) => res.send("DirectPay backend running"));
 
-// ===== Login portal =====
+// =============================================================================
+// Login portal
+// =============================================================================
 app.get("/login", (req, res) => {
-  const error = req.query.err === "1" ? `<div class="err">Invalid password. Try again.</div>` : "";
+  const error = req.query.err === "1" ? `<div class="err">Invalid password. Try again.</div>`
+              : req.query.err === "2" ? `<div class="err">Too many attempts. Wait a few minutes.</div>` : "";
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>RedTrex Admin Login</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
@@ -198,15 +393,27 @@ app.get("/login", (req, res) => {
       <button type="submit">Sign In</button>
     </form></body></html>`);
 });
-app.post("/login", (req, res) => {
+
+app.post("/login", loginLimiter, (req, res) => {
   const supplied = (req.body.token || "").toString();
-  if (!ADMIN_TOKEN || supplied !== ADMIN_TOKEN) return res.redirect("/login?err=1");
-  setAdminCookie(res, supplied);
+  if (!ADMIN_TOKEN || !safeEqual(supplied, ADMIN_TOKEN)) {
+    // Constant-ish delay to slow brute-force probes
+    return setTimeout(() => res.redirect("/login?err=1"), 400);
+  }
+  const sid = createSession(clientIp(req));
+  setAdminCookie(res, sid);
   res.redirect("/admin");
 });
-app.get("/logout", (req, res) => { clearAdminCookie(res); res.redirect("/login"); });
 
-// ===== Admin: list orders =====
+app.get("/logout", (req, res) => {
+  destroySession(getSidFromReq(req));
+  clearAdminCookie(res);
+  res.redirect("/login");
+});
+
+// =============================================================================
+// Admin: list orders
+// =============================================================================
 app.get("/admin", requireAdmin, async (req, res) => {
   let all = [], fetchError = null;
   try {
@@ -216,6 +423,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
   } catch (e) { fetchError = e.message; }
 
   const deleted = req.query.deleted ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ Deleted ${escapeHtml(req.query.deleted)}</div>` : "";
+  const sid = req._sid;
 
   const rows = all.map(o => {
     const items = Array.isArray(o.items) && o.items.length > 0
@@ -256,6 +464,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
       <h1>🛒 RedTrex Orders <small style="font-size:14px;font-weight:400;color:#94a3b8">(${all.length} stored)</small></h1>
       <div style="display:flex;gap:8px">
         <form method="POST" action="/admin/seed-test" style="margin:0">
+          ${csrfFieldHtml(sid)}
           <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Create Test Order</button>
         </form>
         <a class="logout" href="/logout">Sign Out</a>
@@ -268,7 +477,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
     </table></body></html>`);
 });
 
-app.post("/admin/seed-test", requireAdmin, async (req, res) => {
+app.post("/admin/seed-test", requireAdmin, requireCsrf, async (req, res) => {
   const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
   const order_id = `ORD-TEST-${rand}`;
   await saveOrderToKV({
@@ -295,6 +504,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
   } catch (e) { error = e.message; }
   if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
+  const sid = req._sid;
   const success = req.query.saved === "1" ? `<div class="ok">✓ Order updated successfully.</div>` : "";
   const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
   const delerr  = req.query.delerr === "1" ? `<div class="err" style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ You must type <code>DELETE</code> to confirm deletion.</div>` : "";
@@ -346,6 +556,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
     </div>
 
     <form class="card" method="POST" action="/admin/order/${encodeURIComponent(order.order_id)}">
+      ${csrfFieldHtml(sid)}
       <strong style="font-size:16px">Update Order</strong>
       <label for="status">Status</label>
       <select name="status" id="status">
@@ -360,23 +571,18 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       <div style="margin-top:16px"><button class="btn" type="submit">Save Changes</button></div>
     </form>
 
-    ${dangerZoneFormHtml(`/admin/order/${encodeURIComponent(order.order_id)}/delete`, "Order")}
+    ${dangerZoneFormHtml(`/admin/order/${encodeURIComponent(order.order_id)}/delete`, "Order", sid)}
   </body></html>`);
 });
 
-app.post("/admin/order/:id", requireAdmin, async (req, res) => {
+app.post("/admin/order/:id", requireAdmin, requireCsrf, async (req, res) => {
   const order_id = req.params.id;
   const status = (req.body.status || "").toString();
   const keysRaw = (req.body.product_keys || "").toString();
   const product_keys = keysRaw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 
   try {
-    let previous = null;
-    try {
-      const r = await workerFetch(`/orders/get/${encodeURIComponent(order_id)}`);
-      if (r.ok) previous = await r.json();
-    } catch (_) {}
-
+    const previous = await getOrderFromKV(order_id);
     await updateOrderInKV({ order_id, status, product_keys });
 
     let emailed = false;
@@ -406,7 +612,7 @@ app.post("/admin/order/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.post("/admin/order/:id/delete", requireAdmin, async (req, res) => {
+app.post("/admin/order/:id/delete", requireAdmin, requireCsrf, async (req, res) => {
   const order_id = req.params.id;
   const confirm = (req.body.confirm || "").toString().trim().toUpperCase();
   if (confirm !== "DELETE") return res.redirect(`/admin/order/${encodeURIComponent(order_id)}?delerr=1`);
@@ -419,7 +625,9 @@ app.post("/admin/order/:id/delete", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== Admin: list service requests =====
+// =============================================================================
+// Admin: list service requests
+// =============================================================================
 app.get("/admin/services", requireAdmin, async (req, res) => {
   let all = [], fetchError = null;
   try {
@@ -428,6 +636,7 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
     all = data.services || [];
   } catch (e) { fetchError = e.message; }
 
+  const sid = req._sid;
   const deleted = req.query.deleted ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ Deleted ${escapeHtml(req.query.deleted)}</div>` : "";
   const created = req.query.newsvc ? `<div style="background:rgba(22,163,74,.15);color:#4ade80;border:1px solid rgba(22,163,74,.3);padding:10px 14px;border-radius:6px;margin-bottom:14px">✓ New service request created. Share the SVC-ID with the customer.</div>` : "";
 
@@ -465,6 +674,7 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <a href="/admin/services/new" style="background:#dc2626;color:#fff;padding:8px 14px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:700">+ New Service Request</a>
         <form method="POST" action="/admin/services/seed-test" style="margin:0">
+          ${csrfFieldHtml(sid)}
           <button type="submit" style="background:#16a34a;color:#fff;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer">+ Test Request</button>
         </form>
         <a class="logout" href="/logout">Sign Out</a>
@@ -477,7 +687,7 @@ app.get("/admin/services", requireAdmin, async (req, res) => {
     </table></body></html>`);
 });
 
-app.post("/admin/services/seed-test", requireAdmin, async (req, res) => {
+app.post("/admin/services/seed-test", requireAdmin, requireCsrf, async (req, res) => {
   try {
     const r = await fetch(`${ORDERS_WORKER_URL}/services/create`, {
       method: "POST",
@@ -497,8 +707,11 @@ app.post("/admin/services/seed-test", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== Admin: NEW service request form =====
+// =============================================================================
+// Admin: NEW service request form
+// =============================================================================
 app.get("/admin/services/new", requireAdmin, (req, res) => {
+  const sid = req._sid;
   const err = req.query.err ? `<div style="background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:14px">⚠ ${escapeHtml(req.query.err)}</div>` : "";
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>New Service Request</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -522,6 +735,7 @@ app.get("/admin/services/new", requireAdmin, (req, res) => {
     ${err}
     <p style="color:#94a3b8;font-size:14px;margin:0 0 16px">Use this when a customer contacts you by phone/WhatsApp instead of the website. They'll be able to track it using their email + the SVC-ID you give them.</p>
     <form class="card" method="POST" action="/admin/services/new">
+      ${csrfFieldHtml(sid)}
       <div class="grid">
         <div><label>First Name *</label><input name="first_name" required maxlength="60"></div>
         <div><label>Last Name *</label><input name="last_name" required maxlength="60"></div>
@@ -558,21 +772,22 @@ app.get("/admin/services/new", requireAdmin, (req, res) => {
   </body></html>`);
 });
 
-app.post("/admin/services/new", requireAdmin, async (req, res) => {
+app.post("/admin/services/new", requireAdmin, requireCsrf, async (req, res) => {
   try {
+    const b = safeClone(req.body);
     const payload = {
-      first_name: req.body.first_name,
-      last_name: req.body.last_name,
-      email: req.body.email,
-      phone: req.body.phone,
-      service_type: req.body.service_type,
-      description: req.body.description,
-      preferred_date: req.body.preferred_date,
-      location: req.body.location,
-      status: req.body.status,
-      scheduled_for: req.body.scheduled_for,
-      admin_note: req.body.admin_note,
-      quote_amount: Number(req.body.quote_amount) || 0
+      first_name: String(b.first_name || "").slice(0, 60),
+      last_name: String(b.last_name || "").slice(0, 60),
+      email: String(b.email || "").slice(0, 160),
+      phone: String(b.phone || "").slice(0, 30),
+      service_type: SERVICE_TYPES.includes(b.service_type) ? b.service_type : "Custom",
+      description: String(b.description || "").slice(0, 2500),
+      preferred_date: String(b.preferred_date || "").slice(0, 120),
+      location: String(b.location || "").slice(0, 250),
+      status: SERVICE_STATUSES.includes(b.status) ? b.status : "Pending",
+      scheduled_for: String(b.scheduled_for || "").slice(0, 200),
+      admin_note: String(b.admin_note || "").slice(0, 2000),
+      quote_amount: Math.max(0, Number(b.quote_amount) || 0)
     };
     const result = await adminCreateServiceInKV(payload);
     console.log(`[admin] created service ${result.service_id} for ${payload.email}`);
@@ -581,14 +796,14 @@ app.post("/admin/services/new", requireAdmin, async (req, res) => {
     if (payload.email) {
       emailed = await sendServiceEmail("created", {
         to: payload.email,
-        customer_name: `${payload.first_name || ""} ${payload.last_name || ""}`.trim() || "Customer",
+        customer_name: `${payload.first_name} ${payload.last_name}`.trim() || "Customer",
         service_id: result.service_id,
         service_type: payload.service_type,
         description: payload.description,
-        status: payload.status || "Pending",
-        admin_note: payload.admin_note || "",
-        scheduled_for: payload.scheduled_for || "",
-        quote_amount: payload.quote_amount || 0
+        status: payload.status,
+        admin_note: payload.admin_note,
+        scheduled_for: payload.scheduled_for,
+        quote_amount: payload.quote_amount
       });
     }
     res.redirect(`/admin/service/${encodeURIComponent(result.service_id)}?saved=1&newsvc=1${emailed ? "&emailed=1" : ""}`);
@@ -597,7 +812,9 @@ app.post("/admin/services/new", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== Admin: single service request =====
+// =============================================================================
+// Admin: single service request
+// =============================================================================
 app.get("/admin/service/:id", requireAdmin, async (req, res) => {
   let svc = null, error = null;
   try {
@@ -608,6 +825,7 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
   } catch (e) { error = e.message; }
   if (!svc) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(error)}</p>`);
 
+  const sid = req._sid;
   const success = req.query.saved === "1" ? `<div class="ok">✓ Request updated successfully.</div>` : "";
   const emailed = req.query.emailed === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📧 Customer notified by email.</div>` : "";
   const newSvc  = req.query.newsvc === "1" ? `<div class="ok" style="background:rgba(99,102,241,.15);color:#a5b4fc;border-color:rgba(99,102,241,.3)">📬 Share these with the customer:<br><strong>SVC-ID:</strong> <code>${escapeHtml(svc.service_id)}</code><br><strong>Email:</strong> <code>${escapeHtml(svc.customer?.email || "")}</code><br>Tracking page: <a href="https://www.redtrex.com.lk/track-service" style="color:#a5b4fc">redtrex.com.lk/track-service</a></div>` : "";
@@ -656,6 +874,7 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
     </div>
 
     <form class="card" method="POST" action="/admin/service/${encodeURIComponent(svc.service_id)}">
+      ${csrfFieldHtml(sid)}
       <strong style="font-size:16px">Update Request</strong>
       <label for="status">Status</label>
       <select name="status" id="status">${statusOpts}</select>
@@ -669,16 +888,17 @@ app.get("/admin/service/:id", requireAdmin, async (req, res) => {
       <div style="margin-top:16px"><button class="btn" type="submit">Save Changes</button></div>
     </form>
 
-    ${dangerZoneFormHtml(`/admin/service/${encodeURIComponent(svc.service_id)}/delete`, "Request")}
+    ${dangerZoneFormHtml(`/admin/service/${encodeURIComponent(svc.service_id)}/delete`, "Request", sid)}
   </body></html>`);
 });
 
-app.post("/admin/service/:id", requireAdmin, async (req, res) => {
+app.post("/admin/service/:id", requireAdmin, requireCsrf, async (req, res) => {
   const service_id = req.params.id;
-  const status = (req.body.status || "").toString();
-  const admin_note = (req.body.admin_note || "").toString();
-  const scheduled_for = (req.body.scheduled_for || "").toString();
-  const quote_amount = Number(req.body.quote_amount) || 0;
+  const b = safeClone(req.body);
+  const status = SERVICE_STATUSES.includes(b.status) ? b.status : "Pending";
+  const admin_note = String(b.admin_note || "").slice(0, 2000);
+  const scheduled_for = String(b.scheduled_for || "").slice(0, 200);
+  const quote_amount = Math.max(0, Number(b.quote_amount) || 0);
 
   try {
     let previous = null;
@@ -699,8 +919,8 @@ app.post("/admin/service/:id", requireAdmin, async (req, res) => {
         service_type: previous.service_type || "",
         status,
         previous_status: previous.status,
-        admin_note: admin_note || "",
-        scheduled_for: scheduled_for || "",
+        admin_note,
+        scheduled_for,
         quote_amount
       });
     }
@@ -711,7 +931,7 @@ app.post("/admin/service/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.post("/admin/service/:id/delete", requireAdmin, async (req, res) => {
+app.post("/admin/service/:id/delete", requireAdmin, requireCsrf, async (req, res) => {
   const service_id = req.params.id;
   const confirm = (req.body.confirm || "").toString().trim().toUpperCase();
   if (confirm !== "DELETE") return res.redirect(`/admin/service/${encodeURIComponent(service_id)}?delerr=1`);
@@ -724,7 +944,9 @@ app.post("/admin/service/:id/delete", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== JSON endpoints =====
+// =============================================================================
+// JSON endpoints (admin only — header token works here)
+// =============================================================================
 app.get("/orders", requireAdmin, async (req, res) => {
   try { const r = await workerFetch("/orders/list?limit=200"); res.json(await r.json()); }
   catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
@@ -748,15 +970,57 @@ app.get("/services/:id", requireAdmin, async (req, res) => {
   } catch (e) { res.status(502).json({ error: "Failed", detail: e.message }); }
 });
 
-// ===== Payment endpoints =====
-app.post("/create-payment", async (req, res) => {
-  const { order_id, amount, first_name = "", last_name = "", email = "", phone = "",
-    product_name = "", qty = 1, items = [], coupon_code = null } = req.body;
-  if (!order_id || !amount) return res.status(400).json({ error: "Missing order_id or amount" });
+// =============================================================================
+// Payment endpoints — HARDENED
+// =============================================================================
+function generateOrderId() {
+  const buf = crypto.randomBytes(6).toString("hex").toUpperCase();
+  return `ORD-${Date.now().toString(36).toUpperCase()}-${buf}`;
+}
+
+app.post("/create-payment", paymentLimiter, async (req, res) => {
+  const b = safeClone(req.body);
+
+  // ----- Bound + sanitize amount -----
+  const amount = Number(b.amount);
+  if (!Number.isFinite(amount) || amount < MIN_AMOUNT_LKR || amount > MAX_AMOUNT_LKR) {
+    return res.status(400).json({ error: `Amount must be between LKR ${MIN_AMOUNT_LKR} and LKR ${MAX_AMOUNT_LKR}` });
+  }
+
+  // ----- Validate customer fields -----
+  const first_name = String(b.first_name || "").slice(0, 60).trim();
+  const last_name  = String(b.last_name  || "").slice(0, 60).trim();
+  const email      = String(b.email      || "").slice(0, 160).trim();
+  const phone      = String(b.phone      || "").slice(0, 30).trim();
+  if (!first_name || !last_name) return res.status(400).json({ error: "Name required" });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Valid email required" });
+  if (phone.length < 7) return res.status(400).json({ error: "Valid phone required" });
+
+  // ----- Sanitize items[] -----
+  const product_name = String(b.product_name || "").slice(0, MAX_ITEM_NAME);
+  const qty = Math.max(1, Math.min(100, Number(b.qty) || 1));
+  let items = [];
+  if (Array.isArray(b.items)) {
+    if (b.items.length > MAX_ITEMS) return res.status(400).json({ error: "Too many items" });
+    items = b.items.map(it => ({
+      name: String(it?.name || "").slice(0, MAX_ITEM_NAME),
+      quantity: Math.max(1, Math.min(100, Number(it?.quantity || it?.qty) || 1))
+    })).filter(it => it.name.length > 0);
+  }
+  const coupon_code = b.coupon_code ? String(b.coupon_code).slice(0, 50) : null;
+
+  // ----- Server-generated order_id (NEVER trust client) -----
+  const order_id = generateOrderId();
+
+  // ----- Refuse if (extremely unlikely) collision -----
+  if (await getOrderFromKV(order_id)) {
+    return res.status(503).json({ error: "Order ID collision, retry" });
+  }
 
   await saveOrderToKV({
     ts: Date.now(), order_id, amount, product_name, qty, items, coupon_code,
-    customer: { first_name, last_name, email, phone }, status: "Pending"
+    customer: { first_name, last_name, email, phone },
+    status: "Pending"
   });
   console.log(`[order] ${order_id} | ${product_name || items.length + " items"} | LKR ${amount}${coupon_code ? ` | coupon ${coupon_code}` : ""}`);
 
@@ -769,22 +1033,63 @@ app.post("/create-payment", async (req, res) => {
   const payloadString = JSON.stringify(payload);
   const dataString = Buffer.from(payloadString).toString("base64");
   const signature = crypto.createHmac("sha256", DIRECTPAY_SECRET).update(dataString).digest("hex");
-  res.json({ dataString, signature });
+  res.json({ order_id, dataString, signature });
 });
 
 app.post("/callback", async (req, res) => {
   console.log("DirectPay callback received");
   const receivedSignature = req.headers["authorization"]?.replace("Bearer ", "");
   const generatedSignature = crypto.createHmac("sha256", DIRECTPAY_SECRET).update(JSON.stringify(req.body)).digest("hex");
-  if (receivedSignature !== generatedSignature) return res.status(403).send("Invalid signature");
+  if (!receivedSignature || !safeEqual(receivedSignature, generatedSignature)) {
+    return res.status(403).send("Invalid signature");
+  }
 
-  const { order_id, amount, status } = req.body;
+  const b = safeClone(req.body);
+  const order_id = String(b.order_id || "");
+  const amount = b.amount;
+  const status = b.status;
   const normalized = normalizeStatus(status);
-  await saveOrderToKV({ order_id, status: normalized, paid_amount: amount, paid_at: Date.now() });
+
+  // Merge — never overwrite the customer record we already stored
+  const existing = await getOrderFromKV(order_id);
+  if (!existing) {
+    console.warn(`[callback] order ${order_id} not found — ignoring`);
+    return res.status(404).send("Order not found");
+  }
+  await saveOrderToKV({
+    ...existing,
+    order_id,
+    status: normalized,
+    paid_amount: amount,
+    paid_at: Date.now()
+  });
   console.log(`[callback] ${order_id} | ${status} → ${normalized} | LKR ${amount}`);
 
   res.redirect(`https://www.redtrex.store/payment-success?order_id=${encodeURIComponent(order_id)}&amount=${encodeURIComponent(amount)}&status=${encodeURIComponent(status)}`);
 });
+
+// =============================================================================
+// 404 fallback
+// =============================================================================
+app.use(generalLimiter, (req, res) => {
+  res.status(404).send("Not found");
+});
+
+// =============================================================================
+// Startup guard — fail fast if any required secret is missing
+// =============================================================================
+const REQUIRED_SECRETS = {
+  ADMIN_TOKEN, DIRECTPAY_MERCHANT_ID, DIRECTPAY_SECRET, ORDERS_API_KEY
+};
+const missing = Object.entries(REQUIRED_SECRETS).filter(([, v]) => !v).map(([k]) => k);
+if (missing.length) {
+  console.error("FATAL: missing required env vars:", missing.join(", "));
+  process.exit(1);
+}
+if (ADMIN_TOKEN.length < 24) {
+  console.error("FATAL: ADMIN_TOKEN must be at least 24 chars (use a long random string).");
+  process.exit(1);
+}
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Server running on port", PORT));
