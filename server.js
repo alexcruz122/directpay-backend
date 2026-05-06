@@ -59,7 +59,13 @@ app.use(cors({
     // browsers): allow. Known origin: allow. Unknown: don't add CORS headers
     // (browser will block the response) but DON'T throw — throwing turns every
     // request into a 500 and breaks the admin pages themselves.
-    if (!origin) return cb(null, true);
+    //
+    // Mobile browsers (iOS Safari, in-app webviews like FB/IG/WhatsApp, and
+    // some Android browsers after a redirect) sometimes send the literal
+    // string "null" as the Origin header. Treat that the same as missing —
+    // otherwise legitimate mobile checkouts fail intermittently and only
+    // succeed on retry once the browser establishes a fresh Origin.
+    if (!origin || origin === "null") return cb(null, true);
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     console.warn("[cors] blocked origin:", origin);
     return cb(null, false);
