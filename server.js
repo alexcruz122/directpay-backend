@@ -17,6 +17,7 @@
 //   - Server-generated order_id (cannot be supplied or overwritten by client)
 //   - Amount/item bounds checking, prototype-pollution stripping
 //   - No ?token= URL-string admin auth (was leaking via referer/logs)
+//   - Cloudflare Turnstile bot check on /create-payment (no bypass)
 // =============================================================================
 
 import express from "express";
@@ -24,9 +25,6 @@ import crypto from "crypto";
 import cors from "cors";
 
 const app = express();
-// Trust the immediate proxy hop only. We additionally derive the real client IP
-// via clientIp() below (prefers Cloudflare's cf-connecting-ip, then the
-// rightmost X-Forwarded-For entry — the leftmost is attacker-controllable).
 app.set("trust proxy", 1);
 
 function clientIp(req) {
@@ -35,7 +33,7 @@ function clientIp(req) {
   const xff = req.headers["x-forwarded-for"];
   if (xff) {
     const parts = String(xff).split(",").map(s => s.trim()).filter(Boolean);
-    if (parts.length) return parts[parts.length - 1]; // rightmost = closest to us
+    if (parts.length) return parts[parts.length - 1];
   }
   return req.socket?.remoteAddress || req.ip || "unknown";
 }
@@ -55,16 +53,6 @@ const ALLOWED_ORIGINS = new Set([
 ]);
 app.use(cors({
   origin(origin, cb) {
-    // No Origin header (server-to-server, curl, same-origin form POST in some
-    // browsers): allow. Known origin: allow. Unknown: don't add CORS headers
-    // (browser will block the response) but DON'T throw — throwing turns every
-    // request into a 500 and breaks the admin pages themselves.
-    //
-    // Mobile browsers (iOS Safari, in-app webviews like FB/IG/WhatsApp, and
-    // some Android browsers after a redirect) sometimes send the literal
-    // string "null" as the Origin header. Treat that the same as missing —
-    // otherwise legitimate mobile checkouts fail intermittently and only
-    // succeed on retry once the browser establishes a fresh Origin.
     if (!origin || origin === "null") return cb(null, true);
     if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
     console.warn("[cors] blocked origin:", origin);
@@ -83,7 +71,6 @@ app.use((req, res, next) => {
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   res.setHeader("X-DNS-Prefetch-Control", "off");
-  // Admin pages render their own inline CSS, so allow inline styles for self.
   res.setHeader("Content-Security-Policy",
     "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
   next();
@@ -102,6 +89,7 @@ const {
   DIRECTPAY_MERCHANT_ID,
   DIRECTPAY_SECRET,
   ADMIN_TOKEN,
+  TURNSTILE_SECRET,
   ORDERS_WORKER_URL = "https://redtrex-coupons.projectmmdoffcialdev.workers.dev",
   ORDERS_API_KEY,
   EMAIL_WORKER_URL = "https://resend.projectmmdoffcialdev.workers.dev",
@@ -109,20 +97,21 @@ const {
 } = process.env;
 
 const COOKIE_NAME = "rt_admin";
-const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7; // 7 days
+const COOKIE_MAX_AGE_SEC = 60 * 60 * 24 * 7;
 const SERVICE_STATUSES = ["Pending", "Reviewing", "Scheduled", "In Progress", "Completed", "Cancelled"];
 const SERVICE_TYPES = ["Software Installation", "Activation Help", "Data Recovery", "IT Support", "PC Repair", "Network Setup", "Custom"];
 
-// Bounds for /create-payment
 const MIN_AMOUNT_LKR = 10;
 const MAX_AMOUNT_LKR = 500000;
 const MAX_ITEMS = 20;
 const MAX_ITEM_NAME = 200;
 
+const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
 // =============================================================================
-// In-memory session store (random session IDs; cookie no longer holds raw token)
+// In-memory session store
 // =============================================================================
-const sessions = new Map(); // sid -> { ip, exp }
+const sessions = new Map();
 
 function createSession(ip) {
   const sid = crypto.randomBytes(32).toString("hex");
@@ -139,7 +128,6 @@ function isSessionValid(sid) {
 }
 function destroySession(sid) { if (sid) sessions.delete(sid); }
 
-// Periodic cleanup
 setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions) if (s.exp < now) sessions.delete(sid);
@@ -149,7 +137,7 @@ setInterval(() => {
 // Rate limiter (sliding window per IP, in-memory)
 // =============================================================================
 function makeLimiter({ windowMs, max, key = req => clientIp(req) }) {
-  const buckets = new Map(); // key -> [timestamps]
+  const buckets = new Map();
   return (req, res, next) => {
     const k = key(req);
     const now = Date.now();
@@ -186,8 +174,7 @@ function clearAdminCookie(res) {
   res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict`);
 }
 
-// CSRF: HMAC of the session id
-const CSRF_SECRET = ADMIN_TOKEN || "boot"; // tied to the admin token
+const CSRF_SECRET = ADMIN_TOKEN || "boot";
 function csrfToken(sid) {
   return crypto.createHmac("sha256", CSRF_SECRET).update(sid).digest("hex").slice(0, 32);
 }
@@ -199,6 +186,34 @@ function safeEqual(a, b) {
   const bb = Buffer.from(String(b || ""));
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
+}
+
+// =============================================================================
+// Cloudflare Turnstile verification
+// TURNSTILE_SECRET must be set — no bypass is permitted.
+// null token → rejected, invalid token → rejected, missing secret → rejected
+// =============================================================================
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET) return { ok: false, reason: "turnstile-not-configured" };
+  if (!token) return { ok: false, reason: "missing-token" };
+  try {
+    const form = new URLSearchParams();
+    form.append("secret", TURNSTILE_SECRET);
+    form.append("response", String(token).slice(0, 2048));
+    if (ip && ip !== "unknown") form.append("remoteip", ip);
+    const res = await fetch(TURNSTILE_VERIFY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString()
+    });
+    if (!res.ok) return { ok: false, reason: "verify-http-" + res.status };
+    const data = await res.json();
+    return data.success
+      ? { ok: true }
+      : { ok: false, reason: (data["error-codes"] || []).join(",") || "rejected" };
+  } catch (e) {
+    return { ok: false, reason: "verify-error-" + e.message };
+  }
 }
 
 // =============================================================================
@@ -275,7 +290,7 @@ async function sendServiceEmail(type, data) {
 }
 
 // =============================================================================
-// Auth middleware (cookie session OR header token for API tools)
+// Auth middleware
 // =============================================================================
 function getSidFromReq(req) {
   const cookies = parseCookies(req.headers.cookie || "");
@@ -288,10 +303,9 @@ function requireAdmin(req, res, next) {
     req._sid = sid;
     return next();
   }
-  // For programmatic API calls (curl/scripts), still allow header token
   const headerToken = req.headers["x-admin-token"];
   if (headerToken && safeEqual(headerToken, ADMIN_TOKEN)) {
-    req._sid = ""; // header auth = no CSRF needed
+    req._sid = "";
     return next();
   }
   const wantsHtml = (req.headers.accept || "").includes("text/html");
@@ -299,7 +313,6 @@ function requireAdmin(req, res, next) {
   return res.status(401).json({ error: "Unauthorized" });
 }
 function requireCsrf(req, res, next) {
-  // Header-token auth (no cookie) is exempt from CSRF
   if (!req._sid) return next();
   const supplied = (req.body && req.body._csrf) || req.headers["x-csrf-token"] || "";
   if (!safeEqual(supplied, csrfToken(req._sid))) {
@@ -361,7 +374,6 @@ function dangerZoneFormHtml(action, label, sid) {
     </form>`;
 }
 
-// Strip prototype-pollution keys from a flat object
 function safeClone(obj) {
   const out = {};
   for (const k of Object.keys(obj || {})) {
@@ -408,7 +420,6 @@ app.get("/login", (req, res) => {
 app.post("/login", loginLimiter, (req, res) => {
   const supplied = (req.body.token || "").toString();
   if (!ADMIN_TOKEN || !safeEqual(supplied, ADMIN_TOKEN)) {
-    // Constant-ish delay to slow brute-force probes
     return setTimeout(() => res.redirect("/login?err=1"), 400);
   }
   const sid = createSession(clientIp(req));
@@ -507,7 +518,7 @@ app.post("/admin/seed-test", requireAdmin, requireCsrf, async (req, res) => {
 });
 
 // =============================================================================
-// Admin: NEW manual order form (for bank transfers, crypto, QR pay, etc.)
+// Admin: NEW manual order form
 // =============================================================================
 app.get("/admin/orders/new", requireAdmin, (req, res) => {
   const sid = req._sid;
@@ -628,7 +639,6 @@ app.post("/admin/orders/new", requireAdmin, requireCsrf, async (req, res) => {
     await saveOrderToKV(order);
     console.log(`[admin] manual order ${order_id} | ${product_name} ×${qty} | LKR ${amount} | ${payment_method} ref=${payment_reference}`);
 
-    // Auto-email keys if Completed and keys provided
     let emailed = false;
     if (status === "Completed" && product_keys.length && email && ORDER_EMAIL_TOKEN) {
       try {
@@ -1107,7 +1117,7 @@ app.post("/admin/service/:id/delete", requireAdmin, requireCsrf, async (req, res
 });
 
 // =============================================================================
-// JSON endpoints (admin only — header token works here)
+// JSON endpoints (admin only)
 // =============================================================================
 app.get("/orders", requireAdmin, async (req, res) => {
   try { const r = await workerFetch("/orders/list?limit=200"); res.json(await r.json()); }
@@ -1142,6 +1152,14 @@ function generateOrderId() {
 
 app.post("/create-payment", paymentLimiter, async (req, res) => {
   const b = safeClone(req.body);
+  const ip = clientIp(req);
+
+  // ----- Turnstile bot check — no bypass, null/invalid tokens always rejected -----
+  const ts = await verifyTurnstile(b.cf_turnstile_token, ip);
+  if (!ts.ok) {
+    console.warn(`[turnstile] rejected ip=${ip} reason=${ts.reason}`);
+    return res.status(403).json({ error: "Bot check failed. Please refresh the page and try again." });
+  }
 
   // ----- Bound + sanitize amount -----
   const amount = Number(b.amount);
@@ -1174,7 +1192,6 @@ app.post("/create-payment", paymentLimiter, async (req, res) => {
   // ----- Server-generated order_id (NEVER trust client) -----
   const order_id = generateOrderId();
 
-  // ----- Refuse if (extremely unlikely) collision -----
   if (await getOrderFromKV(order_id)) {
     return res.status(503).json({ error: "Order ID collision, retry" });
   }
@@ -1212,7 +1229,6 @@ app.post("/callback", async (req, res) => {
   const status = b.status;
   const normalized = normalizeStatus(status);
 
-  // Merge — never overwrite the customer record we already stored
   const existing = await getOrderFromKV(order_id);
   if (!existing) {
     console.warn(`[callback] order ${order_id} not found — ignoring`);
@@ -1241,7 +1257,7 @@ app.use(generalLimiter, (req, res) => {
 // Startup guard — fail fast if any required secret is missing
 // =============================================================================
 const REQUIRED_SECRETS = {
-  ADMIN_TOKEN, DIRECTPAY_MERCHANT_ID, DIRECTPAY_SECRET, ORDERS_API_KEY
+  ADMIN_TOKEN, DIRECTPAY_MERCHANT_ID, DIRECTPAY_SECRET, ORDERS_API_KEY, TURNSTILE_SECRET
 };
 const missing = Object.entries(REQUIRED_SECRETS).filter(([, v]) => !v).map(([k]) => k);
 if (missing.length) {
@@ -1254,4 +1270,4 @@ if (ADMIN_TOKEN.length < 24) {
 }
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+app.listen(PORT, () => console.log(`RedTrex backend running on port ${PORT}`));
