@@ -358,7 +358,7 @@ function escapeHtml(s) {
 function adminTabsHtml(active) {
   const tab = (href, label, isActive) =>
     `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
-  return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tab("/admin","🛒 Orders",active==="orders")}${tab("/admin/services","🛠️ Service Requests",active==="services")}</div>`;
+  return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">${tab("/admin","🛒 Orders",active==="orders")}${tab("/admin/services","🛠️ Service Requests",active==="services")}${tab("/admin/report","📄 PDF Report",active==="report")}</div>`;
 }
 function dangerZoneFormHtml(action, label, sid) {
   return `
@@ -1244,6 +1244,266 @@ app.post("/callback", async (req, res) => {
   console.log(`[callback] ${order_id} | ${status} → ${normalized} | LKR ${amount}`);
 
   res.redirect(`https://www.redtrex.store/payment-success?order_id=${encodeURIComponent(order_id)}&amount=${encodeURIComponent(amount)}&status=${encodeURIComponent(status)}`);
+});
+
+// =============================================================================
+// Admin: PDF Report — date picker
+// =============================================================================
+app.get("/admin/report", requireAdmin, (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const firstOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>PDF Report — RedTrex Admin</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      *{box-sizing:border-box}
+      body{font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;margin:0}
+      h1{color:#f87171;margin:0 0 6px}
+      .sub{color:#94a3b8;font-size:14px;margin:0 0 24px}
+      .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:24px;max-width:520px}
+      label{display:block;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin:16px 0 6px;font-weight:600}
+      label:first-of-type{margin-top:0}
+      input[type=date]{width:100%;padding:11px 13px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:14px;font-family:inherit;outline:none}
+      input[type=date]:focus{border-color:#f87171}
+      .presets{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+      .preset{padding:6px 13px;background:#0f172a;border:1px solid #334155;border-radius:20px;color:#94a3b8;font-size:12px;cursor:pointer;font-family:inherit}
+      .preset:hover{border-color:#f87171;color:#f87171}
+      .btn{display:block;width:100%;margin-top:20px;padding:13px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:14px;cursor:pointer;text-align:center;letter-spacing:.4px}
+      .btn:hover{background:#b91c1c}
+      .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+      .note{color:#64748b;font-size:12px;margin-top:14px}
+    </style></head><body>
+    ${adminTabsHtml("report")}
+    <h1>📄 Generate PDF Report</h1>
+    <p class="sub">Select a date range to export all transactions as a print-ready PDF.</p>
+    <div class="card">
+      <p style="font-size:13px;color:#94a3b8;margin:0 0 16px">Quick select:</p>
+      <div class="presets">
+        <button class="preset" onclick="setRange(7)">Last 7 days</button>
+        <button class="preset" onclick="setRange(30)">Last 30 days</button>
+        <button class="preset" onclick="setMonth()">This month</button>
+        <button class="preset" onclick="setRange(90)">Last 90 days</button>
+        <button class="preset" onclick="setAll()">All time</button>
+      </div>
+      <form method="GET" action="/admin/report/generate" target="_blank">
+        <div class="grid">
+          <div>
+            <label for="from">From date</label>
+            <input type="date" id="from" name="from" value="${firstOfMonth}" required>
+          </div>
+          <div>
+            <label for="to">To date</label>
+            <input type="date" id="to" name="to" value="${today}" required>
+          </div>
+        </div>
+        <button class="btn" type="submit">🖨 Generate &amp; Print PDF</button>
+      </form>
+      <p class="note">Opens in a new tab. Use your browser's Print → Save as PDF option to download.</p>
+    </div>
+    <script>
+      function setRange(days) {
+        const to = new Date();
+        const from = new Date(Date.now() - (days - 1) * 86400000);
+        document.getElementById('from').value = from.toISOString().slice(0,10);
+        document.getElementById('to').value = to.toISOString().slice(0,10);
+      }
+      function setMonth() {
+        const now = new Date();
+        document.getElementById('from').value = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0,10);
+        document.getElementById('to').value = now.toISOString().slice(0,10);
+      }
+      function setAll() {
+        document.getElementById('from').value = '2024-01-01';
+        document.getElementById('to').value = new Date().toISOString().slice(0,10);
+      }
+    </script>
+  </body></html>`);
+});
+
+// =============================================================================
+// Admin: PDF Report — print-ready output
+// =============================================================================
+app.get("/admin/report/generate", requireAdmin, async (req, res) => {
+  const fromStr = String(req.query.from || "").slice(0, 10);
+  const toStr   = String(req.query.to   || "").slice(0, 10);
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromStr) || !/^\d{4}-\d{2}-\d{2}$/.test(toStr))
+    return res.status(400).send("Invalid date range.");
+
+  const fromTs = new Date(fromStr + "T00:00:00.000Z").getTime();
+  const toTs   = new Date(toStr   + "T23:59:59.999Z").getTime();
+  if (isNaN(fromTs) || isNaN(toTs) || fromTs > toTs)
+    return res.status(400).send("Invalid date range.");
+
+  let all = [], fetchError = null;
+  try {
+    const r = await workerFetch("/orders/list?limit=2000");
+    const data = await r.json();
+    all = data.orders || [];
+  } catch (e) { fetchError = e.message; }
+
+  const filtered = all.filter(o => {
+    const t = Number(o.ts);
+    return t >= fromTs && t <= toTs;
+  }).sort((a, b) => Number(a.ts) - Number(b.ts));
+
+  const totalAmount = filtered.reduce((s, o) => s + (Number(o.amount) || 0), 0);
+  const countByStatus = {};
+  for (const o of filtered) {
+    const st = o.status || "Unknown";
+    countByStatus[st] = (countByStatus[st] || 0) + 1;
+  }
+
+  const statusColor = s => {
+    if (s === "Completed") return "#15803d";
+    if (s === "Pending")   return "#b45309";
+    if (s === "Cancelled") return "#991b1b";
+    if (s === "Refunded")  return "#1d4ed8";
+    return "#475569";
+  };
+  const statusBg = s => {
+    if (s === "Completed") return "#dcfce7";
+    if (s === "Pending")   return "#fef3c7";
+    if (s === "Cancelled") return "#fee2e2";
+    if (s === "Refunded")  return "#dbeafe";
+    return "#f1f5f9";
+  };
+
+  const logoUrl = "https://www.redtrex.com.lk/Assest/company.png";
+  const fromLabel = new Date(fromStr).toLocaleDateString("en-GB", { day:"numeric", month:"long", year:"numeric" });
+  const toLabel   = new Date(toStr  ).toLocaleDateString("en-GB", { day:"numeric", month:"long", year:"numeric" });
+  const generatedAt = new Date().toLocaleString("en-GB", { day:"numeric", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit" });
+
+  const rows = filtered.map((o, i) => {
+    const items = Array.isArray(o.items) && o.items.length
+      ? o.items.map(it => `${escapeHtml(it.name)} ×${it.quantity || it.qty || 1}`).join("<br>")
+      : `${escapeHtml(o.product_name || "—")} ×${o.qty || 1}`;
+    const customer = `${escapeHtml(o.customer?.first_name || "")} ${escapeHtml(o.customer?.last_name || "")}`.trim() || "—";
+    const email    = escapeHtml(o.customer?.email || "—");
+    const phone    = escapeHtml(o.customer?.phone || "—");
+    const dt       = new Date(Number(o.ts)).toLocaleString("en-GB", { day:"2-digit", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit" });
+    const st       = escapeHtml(o.status || "Unknown");
+    const bg       = i % 2 === 1 ? "background:#f8fafc" : "";
+    return `<tr style="${bg}">
+      <td style="font-family:monospace;font-size:10px;white-space:nowrap">${escapeHtml(o.order_id)}</td>
+      <td style="white-space:nowrap;font-size:11px">${dt}</td>
+      <td style="font-size:11px">${items}</td>
+      <td style="white-space:nowrap;font-weight:600">LKR ${Number(o.amount || 0).toLocaleString("en-LK", {minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+      <td style="font-size:11px">${customer}<br><span style="color:#64748b;font-size:10px">${email}<br>${phone}</span></td>
+      <td><span style="display:inline-block;padding:3px 8px;border-radius:12px;font-size:10px;font-weight:700;background:${statusBg(o.status)};color:${statusColor(o.status)}">${st}</span></td>
+    </tr>`;
+  }).join("");
+
+  const summaryBadges = Object.entries(countByStatus).map(([st, cnt]) =>
+    `<span style="display:inline-flex;align-items:center;gap:5px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;background:${statusBg(st)};color:${statusColor(st)};margin:3px">${st}: ${cnt}</span>`
+  ).join(" ");
+
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>RedTrex Transactions ${fromStr} to ${toStr}</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0}
+      body{font-family:Arial,Helvetica,sans-serif;color:#1e293b;background:#fff;padding:28px 32px}
+      .header{display:flex;align-items:center;justify-content:space-between;padding-bottom:18px;border-bottom:3px solid #dc2626;margin-bottom:20px}
+      .header-left{display:flex;align-items:center;gap:16px}
+      .logo{width:56px;height:56px;object-fit:contain;border-radius:10px}
+      .company-name{font-size:22px;font-weight:800;color:#dc2626;letter-spacing:-0.5px}
+      .company-info{font-size:11px;color:#64748b;margin-top:2px;line-height:1.6}
+      .report-meta{text-align:right;font-size:12px;color:#64748b;line-height:1.8}
+      .report-meta strong{color:#1e293b;display:block;font-size:16px;margin-bottom:2px}
+      .summary{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
+      .stat{flex:1;min-width:140px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px}
+      .stat-label{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:#94a3b8;font-weight:600;margin-bottom:4px}
+      .stat-value{font-size:20px;font-weight:800;color:#1e293b}
+      .stat-sub{font-size:11px;color:#64748b;margin-top:3px}
+      table{width:100%;border-collapse:collapse;font-size:12px}
+      thead tr{background:#dc2626}
+      thead th{color:#fff;padding:9px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:700}
+      tbody td{padding:8px 10px;border-bottom:1px solid #e2e8f0;vertical-align:top}
+      .footer{margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#94a3b8}
+      .footer strong{color:#dc2626}
+      .no-print{position:fixed;top:16px;right:16px;display:flex;gap:8px}
+      .print-btn{padding:10px 20px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;box-shadow:0 4px 14px rgba(220,38,38,.35)}
+      .print-btn:hover{background:#b91c1c}
+      .close-btn{padding:10px 18px;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer}
+      .period-badge{display:inline-block;background:#fef2f2;color:#dc2626;border:1px solid #fecaca;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;margin-top:4px}
+      @media print{
+        .no-print{display:none!important}
+        body{padding:16px}
+        @page{size:A4 landscape;margin:12mm}
+      }
+    </style></head><body>
+    <div class="no-print">
+      <button class="close-btn" onclick="window.close()">✕ Close</button>
+      <button class="print-btn" onclick="window.print()">🖨 Print / Save PDF</button>
+    </div>
+
+    <div class="header">
+      <div class="header-left">
+        <img class="logo" src="${logoUrl}" alt="RedTrex Logo" onerror="this.style.display='none'">
+        <div>
+          <div class="company-name">RedTrex Technologies</div>
+          <div class="company-info">
+            📞 +94 71 262 2012 &nbsp;|&nbsp; 🌐 www.redtrex.com.lk<br>
+            📧 support@redtrex.com.lk &nbsp;|&nbsp; Sri Lanka's Trusted Software Reseller
+          </div>
+        </div>
+      </div>
+      <div class="report-meta">
+        <strong>Transaction Report</strong>
+        Period: <span class="period-badge">${escapeHtml(fromLabel)} — ${escapeHtml(toLabel)}</span><br>
+        Generated: ${escapeHtml(generatedAt)}
+      </div>
+    </div>
+
+    <div class="summary">
+      <div class="stat">
+        <div class="stat-label">Total Orders</div>
+        <div class="stat-value">${filtered.length}</div>
+        <div class="stat-sub">in selected period</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Total Revenue</div>
+        <div class="stat-value" style="font-size:16px;color:#dc2626">LKR ${totalAmount.toLocaleString("en-LK", {minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+        <div class="stat-sub">all orders combined</div>
+      </div>
+      <div class="stat" style="flex:2">
+        <div class="stat-label">By Status</div>
+        <div style="margin-top:6px">${summaryBadges || '<span style="color:#94a3b8;font-size:12px">No orders</span>'}</div>
+      </div>
+    </div>
+
+    ${fetchError ? `<p style="color:#dc2626;margin-bottom:12px;font-size:13px">⚠ Warning: could not fully load orders — ${escapeHtml(fetchError)}</p>` : ""}
+
+    <table>
+      <thead>
+        <tr>
+          <th>Order ID</th>
+          <th>Date / Time</th>
+          <th>Items</th>
+          <th>Amount</th>
+          <th>Customer</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || `<tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8">No transactions found in this period.</td></tr>`}
+      </tbody>
+    </table>
+
+    <div class="footer">
+      <div>
+        <strong>RedTrex Technologies</strong> &nbsp;—&nbsp; www.redtrex.com.lk &nbsp;|&nbsp; +94 71 262 2012<br>
+        This is a system-generated report. Confidential — for internal use only.
+      </div>
+      <div style="text-align:right">
+        ${filtered.length} transactions &nbsp;|&nbsp; ${escapeHtml(fromLabel)} to ${escapeHtml(toLabel)}<br>
+        Printed: ${escapeHtml(generatedAt)}
+      </div>
+    </div>
+
+    <script>
+      window.addEventListener('load', () => setTimeout(() => window.print(), 600));
+    </script>
+  </body></html>`);
 });
 
 // =============================================================================
