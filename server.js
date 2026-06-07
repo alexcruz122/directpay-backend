@@ -800,7 +800,10 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   const totalQty    = items.reduce((s, it) => s + Number(it.quantity || it.qty || 1), 0);
   const totalAmt    = Number(order.amount) || 0;
 
-  const fmtLKR = n => Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtLKR = n => {
+    const [int, dec] = (Number(n) || 0).toFixed(2).split(".");
+    return int.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "." + dec;
+  };
 
   // Distribute total evenly across all units (best estimate without per-item prices)
   const unitPriceEach = totalQty > 0 ? totalAmt / totalQty : 0;
