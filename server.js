@@ -1323,6 +1323,10 @@ app.get("/admin/report", requireAdmin, (req, res) => {
 // Admin: PDF Report — print-ready output
 // =============================================================================
 app.get("/admin/report/generate", requireAdmin, async (req, res) => {
+  // Allow inline scripts (for window.print()) and data: images (for embedded logo)
+  res.setHeader("Content-Security-Policy",
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+
   const fromStr = String(req.query.from || "").slice(0, 10);
   const toStr   = String(req.query.to   || "").slice(0, 10);
 
@@ -1333,6 +1337,17 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
   const toTs   = new Date(toStr   + "T23:59:59.999Z").getTime();
   if (isNaN(fromTs) || isNaN(toTs) || fromTs > toTs)
     return res.status(400).send("Invalid date range.");
+
+  // Fetch logo server-side → embed as base64 so it always shows in print/PDF
+  let logoDataUri = "";
+  try {
+    const logoRes = await fetch("https://www.redtrex.com.lk/Assest/company.png");
+    if (logoRes.ok) {
+      const buf = Buffer.from(await logoRes.arrayBuffer());
+      const mime = logoRes.headers.get("content-type") || "image/png";
+      logoDataUri = `data:${mime};base64,${buf.toString("base64")}`;
+    }
+  } catch (_) { /* logo fetch failed — will show text fallback */ }
 
   let all = [], fetchError = null;
   try {
@@ -1368,7 +1383,6 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
     return "#f1f5f9";
   };
 
-  const logoUrl = "https://www.redtrex.com.lk/Assest/company.png";
   const fromLabel = new Date(fromStr).toLocaleDateString("en-GB", { day:"numeric", month:"long", year:"numeric" });
   const toLabel   = new Date(toStr  ).toLocaleDateString("en-GB", { day:"numeric", month:"long", year:"numeric" });
   const generatedAt = new Date().toLocaleString("en-GB", { day:"numeric", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit" });
@@ -1438,7 +1452,7 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
 
     <div class="header">
       <div class="header-left">
-        <img class="logo" src="${logoUrl}" alt="RedTrex Logo" onerror="this.style.display='none'">
+        ${logoDataUri ? `<img class="logo" src="${logoDataUri}" alt="RedTrex Logo">` : `<div style="width:56px;height:56px;background:#dc2626;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:18px">RT</div>`}
         <div>
           <div class="company-name">RedTrex Technologies</div>
           <div class="company-info">
@@ -1501,7 +1515,23 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
     </div>
 
     <script>
-      window.addEventListener('load', () => setTimeout(() => window.print(), 600));
+      (function() {
+        var imgs = document.images;
+        var loaded = 0;
+        var total = imgs.length;
+        function tryPrint() {
+          if (typeof window.print === 'function') window.print();
+        }
+        if (total === 0) {
+          setTimeout(tryPrint, 300);
+        } else {
+          function onLoad() { if (++loaded >= total) setTimeout(tryPrint, 200); }
+          for (var i = 0; i < total; i++) {
+            if (imgs[i].complete) { onLoad(); }
+            else { imgs[i].addEventListener('load', onLoad); imgs[i].addEventListener('error', onLoad); }
+          }
+        }
+      })();
     </script>
   </body></html>`);
 });
