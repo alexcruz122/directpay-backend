@@ -800,17 +800,17 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   const totalQty    = items.reduce((s, it) => s + Number(it.quantity || it.qty || 1), 0);
   const totalAmt    = Number(order.amount) || 0;
 
+  const fmtLKR = n => Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
   // Distribute total evenly across all units (best estimate without per-item prices)
   const unitPriceEach = totalQty > 0 ? totalAmt / totalQty : 0;
   const itemRows    = items.map(it => {
     const qty       = Number(it.quantity || it.qty || 1);
-    const unitPrice = unitPriceEach.toFixed(2);
-    const lineTotal = (unitPriceEach * qty).toFixed(2);
     return `<tr>
       <td>${escapeHtml(it.name)}</td>
       <td style="text-align:center">${qty}</td>
-      <td style="text-align:right">LKR ${escapeHtml(unitPrice)}</td>
-      <td style="text-align:right">LKR ${escapeHtml(lineTotal)}</td>
+      <td style="text-align:right">LKR ${fmtLKR(unitPriceEach)}</td>
+      <td style="text-align:right">LKR ${fmtLKR(unitPriceEach * qty)}</td>
     </tr>`;
   }).join("");
 
@@ -951,10 +951,10 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   <!-- Totals -->
   <div class="inv-totals">
     <table>
-      <tr><td class="l">Sub-Total:</td><td class="r">LKR ${escapeHtml(String(totalAmt.toFixed(2)))}</td></tr>
+      <tr><td class="l">Sub-Total:</td><td class="r">LKR ${fmtLKR(totalAmt)}</td></tr>
       ${order.payment_method && order.payment_method.toLowerCase().includes("card")
         ? `<tr><td class="l">Payment Processing Fee:</td><td class="r" style="color:#888">Included</td></tr>` : ""}
-      <tr class="inv-total-row"><td class="l">Total:</td><td class="r">LKR ${escapeHtml(String(totalAmt.toFixed(2)))}</td></tr>
+      <tr class="inv-total-row"><td class="l">Total:</td><td class="r">LKR ${fmtLKR(totalAmt)}</td></tr>
     </table>
   </div>
 
