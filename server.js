@@ -800,17 +800,17 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   const totalQty    = items.reduce((s, it) => s + Number(it.quantity || it.qty || 1), 0);
   const totalAmt    = Number(order.amount) || 0;
 
-  // Per-item pricing (only reliable when single item)
-  const singleItem  = items.length === 1;
+  // Distribute total evenly across all units (best estimate without per-item prices)
+  const unitPriceEach = totalQty > 0 ? totalAmt / totalQty : 0;
   const itemRows    = items.map(it => {
     const qty       = Number(it.quantity || it.qty || 1);
-    const unitPrice = singleItem ? (totalAmt / qty).toFixed(2) : null;
-    const lineTotal = singleItem ? totalAmt.toFixed(2) : null;
+    const unitPrice = unitPriceEach.toFixed(2);
+    const lineTotal = (unitPriceEach * qty).toFixed(2);
     return `<tr>
       <td>${escapeHtml(it.name)}</td>
       <td style="text-align:center">${qty}</td>
-      <td style="text-align:right">${unitPrice ? "LKR " + escapeHtml(unitPrice) : "—"}</td>
-      <td style="text-align:right">${lineTotal ? "LKR " + escapeHtml(lineTotal) : "—"}</td>
+      <td style="text-align:right">LKR ${escapeHtml(unitPrice)}</td>
+      <td style="text-align:right">LKR ${escapeHtml(lineTotal)}</td>
     </tr>`;
   }).join("");
 
