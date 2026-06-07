@@ -355,6 +355,11 @@ function serviceBadgeHtml(status) {
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
+function fmtLKR(n) {
+  const [int, dec] = (Number(n) || 0).toFixed(2).split(".");
+  return "LKR " + int.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "." + dec;
+}
+const BUILD_TS = new Date().toISOString();
 function adminTabsHtml(active) {
   const tab = (href, label, isActive) =>
     `<a href="${href}" style="padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;font-weight:600;${isActive ? "background:#dc2626;color:#fff" : "background:#1e293b;color:#e2e8f0;border:1px solid #334155"}">${label}</a>`;
@@ -456,7 +461,7 @@ app.get("/admin", requireAdmin, async (req, res) => {
         <td><a href="/admin/order/${encodeURIComponent(o.order_id)}" style="color:#f87171;text-decoration:none"><code>${escapeHtml(o.order_id)}</code></a></td>
         <td>${new Date(o.ts).toLocaleString()}</td>
         <td>${items}</td>
-        <td>LKR ${o.amount}</td>
+        <td>${fmtLKR(o.amount)}</td>
         <td>${escapeHtml(o.coupon_code || "-")}</td>
         <td>${escapeHtml(o.customer?.first_name || "")} ${escapeHtml(o.customer?.last_name || "")}<br>
             <small style="color:#94a3b8">${escapeHtml(o.customer?.email || "")}<br>${escapeHtml(o.customer?.phone || "")}</small></td>
@@ -712,7 +717,7 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       <div class="row"><span>Status</span><span>${statusBadgeHtml(order.status)}</span></div>
       <div class="row"><span>Placed</span><span>${new Date(order.ts).toLocaleString()}</span></div>
       ${order.paid_at ? `<div class="row"><span>Paid at</span><span>${new Date(order.paid_at).toLocaleString()}</span></div>` : ""}
-      <div class="row"><span>Amount</span><span><strong>LKR ${order.amount}</strong></span></div>
+      <div class="row"><span>Amount</span><span><strong>${fmtLKR(order.amount)}</strong></span></div>
       ${order.coupon_code ? `<div class="row"><span>Coupon</span><span>${escapeHtml(order.coupon_code)}</span></div>` : ""}
       <div class="row"><span>Customer</span><span>${escapeHtml(order.customer?.first_name || "")} ${escapeHtml(order.customer?.last_name || "")}</span></div>
       <div class="row"><span>Email</span><span>${escapeHtml(order.customer?.email || "—")}</span></div>
@@ -800,11 +805,6 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   const totalQty    = items.reduce((s, it) => s + Number(it.quantity || it.qty || 1), 0);
   const totalAmt    = Number(order.amount) || 0;
 
-  const fmtLKR = n => {
-    const [int, dec] = (Number(n) || 0).toFixed(2).split(".");
-    return int.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "." + dec;
-  };
-
   // Distribute total evenly across all units (best estimate without per-item prices)
   const unitPriceEach = totalQty > 0 ? totalAmt / totalQty : 0;
   const itemRows    = items.map(it => {
@@ -812,8 +812,8 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
     return `<tr>
       <td>${escapeHtml(it.name)}</td>
       <td style="text-align:center">${qty}</td>
-      <td style="text-align:right">LKR ${fmtLKR(unitPriceEach)}</td>
-      <td style="text-align:right">LKR ${fmtLKR(unitPriceEach * qty)}</td>
+      <td style="text-align:right">${fmtLKR(unitPriceEach)}</td>
+      <td style="text-align:right">${fmtLKR(unitPriceEach * qty)}</td>
     </tr>`;
   }).join("");
 
@@ -954,10 +954,10 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   <!-- Totals -->
   <div class="inv-totals">
     <table>
-      <tr><td class="l">Sub-Total:</td><td class="r">LKR ${fmtLKR(totalAmt)}</td></tr>
+      <tr><td class="l">Sub-Total:</td><td class="r">${fmtLKR(totalAmt)}</td></tr>
       ${order.payment_method && order.payment_method.toLowerCase().includes("card")
         ? `<tr><td class="l">Payment Processing Fee:</td><td class="r" style="color:#888">Included</td></tr>` : ""}
-      <tr class="inv-total-row"><td class="l">Total:</td><td class="r">LKR ${fmtLKR(totalAmt)}</td></tr>
+      <tr class="inv-total-row"><td class="l">Total:</td><td class="r">${fmtLKR(totalAmt)}</td></tr>
     </table>
   </div>
 
@@ -969,6 +969,7 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
 
   <div class="inv-footer">
     This is a system-generated invoice. &nbsp;|&nbsp; RedTrex Technologies &nbsp;|&nbsp; www.redtrex.com.lk
+    <br><span style="font-size:10px;color:#ccc">build: ${BUILD_TS}</span>
   </div>
 
 </div>
