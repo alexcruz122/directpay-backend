@@ -910,7 +910,7 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
         <tr><td>Date:</td><td>${escapeHtml(orderDate)}</td></tr>
         <tr><td>Invoice No.:</td><td>${safeInvoiceNum}</td></tr>
         <tr><td>Order ID:</td><td style="font-family:monospace;font-size:11px">${safeOrderId}</td></tr>
-        <tr><td>Payment Method:</td><td>${escapeHtml(order.payment_method || "—")}</td></tr>
+        <tr><td>Payment Method:</td><td>${escapeHtml(order.payment_method || "Credit/Debit Card &amp; Other Payment Methods")}</td></tr>
         <tr><td>Status:</td><td>${escapeHtml(order.status || "—")}</td></tr>
       </table>
       <div class="barcode-wrap">
@@ -927,8 +927,7 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
       <p>
         <strong>${escapeHtml(custName)}</strong><br>
         ${order.customer?.email ? `Email: ${escapeHtml(order.customer.email)}<br>` : ""}
-        ${order.customer?.phone ? `Tel: ${escapeHtml(order.customer.phone)}<br>` : ""}
-        Sri Lanka
+        ${order.customer?.phone ? `Tel: ${escapeHtml(order.customer.phone)}` : ""}
       </p>
     </div>
   </div>
@@ -979,8 +978,8 @@ app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
   try {
     JsBarcode("#inv-barcode", ${JSON.stringify(order.order_id)}, {
       format: "CODE128",
-      width: 1.4,
-      height: 48,
+      width: 1.0,
+      height: 36,
       displayValue: false,
       margin: 0,
       background: "#ffffff",
