@@ -1325,7 +1325,7 @@ app.get("/admin/report", requireAdmin, (req, res) => {
 app.get("/admin/report/generate", requireAdmin, async (req, res) => {
   // Allow inline scripts (for window.print()) and data: images (for embedded logo)
   res.setHeader("Content-Security-Policy",
-    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+    "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
 
   const fromStr = String(req.query.from || "").slice(0, 10);
   const toStr   = String(req.query.to   || "").slice(0, 10);
@@ -1434,22 +1434,22 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
       tbody td{padding:8px 10px;border-bottom:1px solid #e2e8f0;vertical-align:top}
       .footer{margin-top:24px;padding-top:14px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;font-size:10px;color:#94a3b8}
       .footer strong{color:#dc2626}
-      .no-print{position:fixed;top:16px;right:16px;display:flex;gap:8px}
-      .print-btn{padding:10px 20px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;box-shadow:0 4px 14px rgba(220,38,38,.35)}
-      .print-btn:hover{background:#b91c1c}
+      .toolbar{position:fixed;top:16px;right:16px;display:flex;gap:8px;z-index:9999}
+      .dl-btn{padding:10px 20px;background:#dc2626;color:#fff;border:none;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;box-shadow:0 4px 14px rgba(220,38,38,.35)}
+      .dl-btn:hover{background:#b91c1c}
+      .dl-btn:disabled{background:#94a3b8;cursor:not-allowed;box-shadow:none}
       .close-btn{padding:10px 18px;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;border-radius:8px;font-weight:600;font-size:13px;cursor:pointer}
       .period-badge{display:inline-block;background:#fef2f2;color:#dc2626;border:1px solid #fecaca;border-radius:6px;padding:3px 10px;font-size:12px;font-weight:600;margin-top:4px}
-      @media print{
-        .no-print{display:none!important}
-        body{padding:16px}
-        @page{size:A4 landscape;margin:12mm}
-      }
-    </style></head><body>
-    <div class="no-print">
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    </head><body>
+    <div class="toolbar" id="toolbar">
       <button class="close-btn" onclick="window.close()">✕ Close</button>
-      <button class="print-btn" onclick="window.print()">🖨 Print / Save PDF</button>
+      <button class="dl-btn" id="dlBtn" onclick="downloadPdf()">⬇ Download PDF</button>
     </div>
 
+    <div id="report-body">
     <div class="header">
       <div class="header-left">
         ${logoDataUri ? `<img class="logo" src="${logoDataUri}" alt="RedTrex Logo">` : `<div style="width:56px;height:56px;background:#dc2626;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:18px">RT</div>`}
@@ -1457,7 +1457,7 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
           <div class="company-name">RedTrex Technologies</div>
           <div class="company-info">
             📞 +94 71 262 2012 &nbsp;|&nbsp; 🌐 www.redtrex.com.lk<br>
-            📧 support@redtrex.com.lk &nbsp;|&nbsp; Sri Lanka's Trusted Software Reseller
+            📧 support@redtrex.com.lk &nbsp;|&nbsp; 📍 74, KatuwaPitiya Road, Negombo, 11500, Sri Lanka
           </div>
         </div>
       </div>
@@ -1513,25 +1513,72 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
         Printed: ${escapeHtml(generatedAt)}
       </div>
     </div>
+    </div>
 
     <script>
-      (function() {
-        var imgs = document.images;
-        var loaded = 0;
-        var total = imgs.length;
-        function tryPrint() {
-          if (typeof window.print === 'function') window.print();
-        }
-        if (total === 0) {
-          setTimeout(tryPrint, 300);
-        } else {
-          function onLoad() { if (++loaded >= total) setTimeout(tryPrint, 200); }
-          for (var i = 0; i < total; i++) {
-            if (imgs[i].complete) { onLoad(); }
-            else { imgs[i].addEventListener('load', onLoad); imgs[i].addEventListener('error', onLoad); }
+      async function downloadPdf() {
+        var btn = document.getElementById('dlBtn');
+        var toolbar = document.getElementById('toolbar');
+        btn.disabled = true;
+        btn.textContent = '⏳ Generating...';
+        toolbar.style.display = 'none';
+
+        try {
+          var { jsPDF } = window.jspdf;
+          var reportEl = document.getElementById('report-body');
+
+          var canvas = await html2canvas(reportEl, {
+            scale: 2,
+            useCORS: true,
+            allowTaint: true,
+            backgroundColor: '#ffffff',
+            logging: false
+          });
+
+          var imgData = canvas.toDataURL('image/jpeg', 0.95);
+          var pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+
+          var pageW = pdf.internal.pageSize.getWidth();
+          var pageH = pdf.internal.pageSize.getHeight();
+          var margin = 8;
+          var usableW = pageW - margin * 2;
+          var usableH = pageH - margin * 2;
+
+          var imgW = canvas.width;
+          var imgH = canvas.height;
+          var ratio = imgW / imgH;
+
+          var pdfImgW = usableW;
+          var pdfImgH = usableW / ratio;
+
+          var pageCount = Math.ceil(pdfImgH / usableH);
+
+          for (var page = 0; page < pageCount; page++) {
+            if (page > 0) pdf.addPage();
+            var srcY = page * (imgH / pageCount);
+            var sliceH = imgH / pageCount;
+
+            var sliceCanvas = document.createElement('canvas');
+            sliceCanvas.width = imgW;
+            sliceCanvas.height = sliceH;
+            var ctx = sliceCanvas.getContext('2d');
+            ctx.drawImage(canvas, 0, srcY, imgW, sliceH, 0, 0, imgW, sliceH);
+
+            var sliceData = sliceCanvas.toDataURL('image/jpeg', 0.95);
+            pdf.addImage(sliceData, 'JPEG', margin, margin, pdfImgW, usableH);
           }
+
+          var fromStr = '${escapeHtml(fromStr)}';
+          var toStr   = '${escapeHtml(toStr)}';
+          pdf.save('RedTrex-Transactions-' + fromStr + '-to-' + toStr + '.pdf');
+        } catch(e) {
+          alert('PDF generation failed: ' + e.message);
+        } finally {
+          toolbar.style.display = 'flex';
+          btn.disabled = false;
+          btn.textContent = '⬇ Download PDF';
         }
-      })();
+      }
     </script>
   </body></html>`);
 });
