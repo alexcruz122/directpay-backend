@@ -1527,45 +1527,63 @@ app.get("/admin/report/generate", requireAdmin, async (req, res) => {
           var { jsPDF } = window.jspdf;
           var reportEl = document.getElementById('report-body');
 
+          // Fix capture width to A4 portrait (794px ≈ 210mm at 96dpi)
+          // This ensures the canvas matches A4 proportions before scaling
+          var CAPTURE_WIDTH = 794;
+          var origWidth = reportEl.style.width;
+          var origMaxWidth = reportEl.style.maxWidth;
+          reportEl.style.width = CAPTURE_WIDTH + 'px';
+          reportEl.style.maxWidth = CAPTURE_WIDTH + 'px';
+
           var canvas = await html2canvas(reportEl, {
             scale: 2,
             useCORS: true,
             allowTaint: true,
             backgroundColor: '#ffffff',
-            logging: false
+            logging: false,
+            width: CAPTURE_WIDTH,
+            windowWidth: CAPTURE_WIDTH
           });
 
-          var imgData = canvas.toDataURL('image/jpeg', 0.95);
-          var pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+          reportEl.style.width = origWidth;
+          reportEl.style.maxWidth = origMaxWidth;
 
-          var pageW = pdf.internal.pageSize.getWidth();
-          var pageH = pdf.internal.pageSize.getHeight();
-          var margin = 8;
-          var usableW = pageW - margin * 2;
-          var usableH = pageH - margin * 2;
+          var pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+          // A4 portrait: 210mm wide × 297mm tall
+          var pageW = pdf.internal.pageSize.getWidth();   // 210
+          var pageH = pdf.internal.pageSize.getHeight();  // 297
+          var margin = 10;
+          var usableW = pageW - margin * 2;  // 190mm
+          var usableH = pageH - margin * 2;  // 277mm
 
-          var imgW = canvas.width;
-          var imgH = canvas.height;
-          var ratio = imgW / imgH;
+          var canvasW = canvas.width;
+          var canvasH = canvas.height;
 
-          var pdfImgW = usableW;
-          var pdfImgH = usableW / ratio;
+          // mm per pixel — preserves aspect ratio
+          var mmPerPx = usableW / canvasW;
 
-          var pageCount = Math.ceil(pdfImgH / usableH);
+          // How many canvas pixels fit in one PDF page height
+          var pxPerPage = Math.floor(usableH / mmPerPx);
+          var pageCount = Math.ceil(canvasH / pxPerPage);
 
           for (var page = 0; page < pageCount; page++) {
             if (page > 0) pdf.addPage();
-            var srcY = page * (imgH / pageCount);
-            var sliceH = imgH / pageCount;
 
+            var srcY = page * pxPerPage;
+            var srcH = Math.min(pxPerPage, canvasH - srcY);
+
+            // Slice just this page's rows from the canvas
             var sliceCanvas = document.createElement('canvas');
-            sliceCanvas.width = imgW;
-            sliceCanvas.height = sliceH;
+            sliceCanvas.width  = canvasW;
+            sliceCanvas.height = srcH;
             var ctx = sliceCanvas.getContext('2d');
-            ctx.drawImage(canvas, 0, srcY, imgW, sliceH, 0, 0, imgW, sliceH);
+            ctx.drawImage(canvas, 0, srcY, canvasW, srcH, 0, 0, canvasW, srcH);
 
-            var sliceData = sliceCanvas.toDataURL('image/jpeg', 0.95);
-            pdf.addImage(sliceData, 'JPEG', margin, margin, pdfImgW, usableH);
+            var sliceData = sliceCanvas.toDataURL('image/jpeg', 0.97);
+
+            // Slice height in mm — never distorts, always proportional
+            var sliceHeightMm = srcH * mmPerPx;
+            pdf.addImage(sliceData, 'JPEG', margin, margin, usableW, sliceHeightMm);
           }
 
           var fromStr = '${escapeHtml(fromStr)}';
