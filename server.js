@@ -461,7 +461,10 @@ app.get("/admin", requireAdmin, async (req, res) => {
         <td>${escapeHtml(o.customer?.first_name || "")} ${escapeHtml(o.customer?.last_name || "")}<br>
             <small style="color:#94a3b8">${escapeHtml(o.customer?.email || "")}<br>${escapeHtml(o.customer?.phone || "")}</small></td>
         <td>${statusBadgeHtml(o.status)}</td>
-        <td><a href="/admin/order/${encodeURIComponent(o.order_id)}" style="background:#dc2626;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:700">Manage</a></td>
+        <td style="white-space:nowrap">
+          <a href="/admin/order/${encodeURIComponent(o.order_id)}" style="background:#dc2626;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:700">Manage</a>
+          <a href="/admin/order/${encodeURIComponent(o.order_id)}/invoice" target="_blank" style="background:#1d4ed8;color:#fff;padding:6px 10px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:700;margin-left:4px">📄 Invoice</a>
+        </td>
       </tr>`;
   }).join("");
 
@@ -743,8 +746,310 @@ app.get("/admin/order/:id", requireAdmin, async (req, res) => {
       <div style="margin-top:16px"><button class="btn" type="submit">Save Changes</button></div>
     </form>
 
+    <div style="margin-top:10px">
+      <a href="/admin/order/${encodeURIComponent(order.order_id)}/invoice" target="_blank"
+         style="display:inline-block;padding:10px 20px;background:#1d4ed8;color:#fff;border-radius:6px;font-weight:700;font-size:13px;text-decoration:none">
+        📄 Generate Invoice PDF
+      </a>
+    </div>
+
     ${dangerZoneFormHtml(`/admin/order/${encodeURIComponent(order.order_id)}/delete`, "Order", sid)}
   </body></html>`);
+});
+
+// ── Invoice PDF page ────────────────────────────────────────────────────────
+app.get("/admin/order/:id/invoice", requireAdmin, async (req, res) => {
+  let order = null, fetchErr = null;
+  try {
+    const r = await workerFetch(`/orders/get/${encodeURIComponent(req.params.id)}`);
+    if (r.status === 404)
+      return res.status(404).send(`<p style="font-family:system-ui;padding:30px;color:#fff;background:#0f172a">Order not found. <a href="/admin" style="color:#f87171">← Back</a></p>`);
+    order = await r.json();
+  } catch (e) { fetchErr = e.message; }
+  if (!order) return res.send(`<p style="color:red;font-family:system-ui">Error: ${escapeHtml(fetchErr)}</p>`);
+
+  res.setHeader("Content-Security-Policy",
+    "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; " +
+    "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; " +
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+
+  // Fetch logos as base64 (all in parallel)
+  async function fetchB64(url) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) return null;
+      const buf = Buffer.from(await r.arrayBuffer());
+      const mime = r.headers.get("content-type") || "image/png";
+      return `data:${mime};base64,${buf.toString("base64")}`;
+    } catch { return null; }
+  }
+
+  const [logoUri, msLogoUri, easeusLogoUri] = await Promise.all([
+    fetchB64("https://www.redtrex.com.lk/Assest/company.png"),
+    fetchB64("https://www.redtrex.com.lk/Assest/microsoft-partner.png"),
+    fetchB64("https://www.redtrex.com.lk/Assest/easeus-partner.png"),
+  ]);
+
+  const items = Array.isArray(order.items) && order.items.length > 0
+    ? order.items
+    : [{ name: order.product_name || "Item", quantity: order.qty || 1 }];
+
+  const invoiceNum  = `INV-RTX-${order.order_id.replace(/^ORD-/, "").slice(-14)}`;
+  const orderDate   = new Date(order.ts).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  const custName    = `${order.customer?.first_name || ""} ${order.customer?.last_name || ""}`.trim() || "—";
+  const totalQty    = items.reduce((s, it) => s + Number(it.quantity || it.qty || 1), 0);
+  const totalAmt    = Number(order.amount) || 0;
+
+  // Per-item pricing (only reliable when single item)
+  const singleItem  = items.length === 1;
+  const itemRows    = items.map(it => {
+    const qty       = Number(it.quantity || it.qty || 1);
+    const unitPrice = singleItem ? (totalAmt / qty).toFixed(2) : null;
+    const lineTotal = singleItem ? totalAmt.toFixed(2) : null;
+    return `<tr>
+      <td>${escapeHtml(it.name)}</td>
+      <td style="text-align:center">${qty}</td>
+      <td style="text-align:right">${unitPrice ? "LKR " + escapeHtml(unitPrice) : "—"}</td>
+      <td style="text-align:right">${lineTotal ? "LKR " + escapeHtml(lineTotal) : "—"}</td>
+    </tr>`;
+  }).join("");
+
+  const logoHtml = logoUri
+    ? `<img src="${logoUri}" style="height:70px;object-fit:contain;display:block">`
+    : `<span style="font-size:28px;font-weight:900;color:#dc2626;letter-spacing:-1px">RedTrex<br><span style="font-size:12px;font-weight:400;color:#555;letter-spacing:0">Technologies</span></span>`;
+
+  const msPartnerHtml = msLogoUri
+    ? `<img src="${msLogoUri}" alt="Microsoft Partner" style="height:44px;object-fit:contain">`
+    : `<div style="display:inline-flex;align-items:center;gap:8px;border:1px solid #ccc;padding:8px 14px;border-radius:4px;font-size:11px;font-weight:700;color:#444">
+         <span style="color:#00a1f1;font-size:18px">⊞</span> Microsoft Partner
+       </div>`;
+
+  const easeusPartnerHtml = easeusLogoUri
+    ? `<img src="${easeusLogoUri}" alt="EaseUS Partner" style="height:44px;object-fit:contain">`
+    : `<div style="display:inline-flex;align-items:center;gap:8px;border:1px solid #ccc;padding:8px 14px;border-radius:4px;font-size:11px;font-weight:700;color:#444">
+         <span style="color:#f97316;font-size:18px">🔒</span> EaseUS Partner
+       </div>`;
+
+  const safeOrderId = escapeHtml(order.order_id);
+  const safeInvoiceNum = escapeHtml(invoiceNum);
+
+  res.send(`<!DOCTYPE html><html lang="en"><head>
+  <meta charset="utf-8">
+  <title>Invoice ${safeInvoiceNum}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:Arial,Helvetica,sans-serif;background:#e5e7eb;color:#222}
+    #toolbar{display:flex;justify-content:center;align-items:center;gap:12px;padding:14px 20px;background:#0f172a;position:sticky;top:0;z-index:10}
+    #toolbar a,#toolbar button{display:inline-block;padding:9px 20px;border-radius:6px;font-size:13px;font-weight:700;text-decoration:none;cursor:pointer;border:none;font-family:inherit}
+    .btn-back{background:#334155;color:#e2e8f0}
+    .btn-dl{background:#dc2626;color:#fff;font-size:14px}
+    #invoice-body{background:#fff;width:794px;margin:24px auto 40px;padding:44px 52px;box-shadow:0 4px 24px rgba(0,0,0,.15)}
+    .inv-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px}
+    .inv-title{font-size:30px;font-weight:300;color:#aaa;letter-spacing:4px;text-transform:uppercase;margin-top:8px}
+    .red-rule{border:none;border-top:3px solid #dc2626;margin:16px 0}
+    .thin-rule{border:none;border-top:1px solid #ddd;margin:18px 0}
+    .inv-info{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px}
+    .inv-from{font-size:13px;line-height:1.8;color:#333}
+    .inv-from strong{font-size:14px;display:block;margin-bottom:2px}
+    .inv-meta{font-size:13px}
+    .inv-meta table{border-collapse:collapse}
+    .inv-meta td{padding:3px 8px;vertical-align:top}
+    .inv-meta td:first-child{font-weight:700;white-space:nowrap;text-align:right;color:#333}
+    .inv-meta td:last-child{color:#555;text-align:right}
+    .barcode-wrap{text-align:right;margin-top:12px}
+    .inv-addr-row{display:flex;gap:50px;margin-bottom:4px}
+    .inv-addr-block{flex:1}
+    .inv-addr-block h3{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:#dc2626;padding-bottom:6px;border-bottom:1px solid #ddd;margin-bottom:10px}
+    .inv-addr-block p{font-size:13px;line-height:1.9;color:#333}
+    .inv-table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:4px}
+    .inv-table thead tr{background:#1e293b;color:#fff}
+    .inv-table th{padding:10px 12px;text-align:left;font-size:12px;font-weight:700;letter-spacing:.4px}
+    .inv-table th.r{text-align:right}
+    .inv-table td{padding:10px 12px;border-bottom:1px solid #eee;vertical-align:top;color:#333}
+    .inv-table td.r{text-align:right}
+    .inv-totals{display:flex;justify-content:flex-end;margin-top:10px}
+    .inv-totals table{border-collapse:collapse;min-width:300px}
+    .inv-totals td{padding:5px 10px;font-size:13px;color:#444}
+    .inv-totals td.l{font-weight:600;color:#333}
+    .inv-totals td.r{text-align:right;font-weight:600}
+    .inv-total-row td{border-top:2px solid #dc2626 !important;padding-top:8px;font-size:15px;font-weight:700;color:#dc2626}
+    .inv-partners{display:flex;align-items:center;justify-content:center;gap:24px;margin-top:32px;padding-top:18px;border-top:1px solid #eee;flex-wrap:wrap}
+    .inv-footer{text-align:center;font-size:11px;color:#aaa;margin-top:14px}
+    @media print{#toolbar{display:none!important}}
+  </style>
+</head><body>
+
+<div id="toolbar">
+  <a class="btn-back" href="/admin/order/${encodeURIComponent(order.order_id)}">← Back to Order</a>
+  <button class="btn-dl" id="dlBtn" onclick="downloadInvoice()">⬇ Download Invoice PDF</button>
+</div>
+
+<div id="invoice-body">
+
+  <!-- Header -->
+  <div class="inv-head">
+    <div>${logoHtml}</div>
+    <div class="inv-title">Invoice</div>
+  </div>
+  <hr class="red-rule">
+
+  <!-- Company info + Invoice meta -->
+  <div class="inv-info">
+    <div class="inv-from">
+      <strong>RedTrex Technologies</strong>
+      74, KatuwaPitiya Road<br>
+      Negombo, 11500<br>
+      Sri Lanka<br>
+      Tel: +94 71 262 2012<br>
+      Email: support@redtrex.com.lk<br>
+      www.redtrex.com.lk
+    </div>
+    <div class="inv-meta">
+      <table>
+        <tr><td>Date:</td><td>${escapeHtml(orderDate)}</td></tr>
+        <tr><td>Invoice No.:</td><td>${safeInvoiceNum}</td></tr>
+        <tr><td>Order ID:</td><td style="font-family:monospace;font-size:11px">${safeOrderId}</td></tr>
+        <tr><td>Payment Method:</td><td>${escapeHtml(order.payment_method || "—")}</td></tr>
+        <tr><td>Status:</td><td>${escapeHtml(order.status || "—")}</td></tr>
+      </table>
+      <div class="barcode-wrap">
+        <svg id="inv-barcode"></svg>
+      </div>
+    </div>
+  </div>
+  <hr class="thin-rule">
+
+  <!-- Billing address -->
+  <div class="inv-addr-row">
+    <div class="inv-addr-block">
+      <h3>Billing / Customer Details</h3>
+      <p>
+        <strong>${escapeHtml(custName)}</strong><br>
+        ${order.customer?.email ? `Email: ${escapeHtml(order.customer.email)}<br>` : ""}
+        ${order.customer?.phone ? `Tel: ${escapeHtml(order.customer.phone)}<br>` : ""}
+        Sri Lanka
+      </p>
+    </div>
+  </div>
+  <hr class="thin-rule">
+
+  <!-- Items table -->
+  <table class="inv-table">
+    <thead>
+      <tr>
+        <th>Product Name</th>
+        <th class="r" style="width:60px">Qty</th>
+        <th class="r" style="width:130px">Unit Price</th>
+        <th class="r" style="width:130px">Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${itemRows}
+    </tbody>
+  </table>
+
+  <!-- Totals -->
+  <div class="inv-totals">
+    <table>
+      <tr><td class="l">Sub-Total:</td><td class="r">LKR ${escapeHtml(String(totalAmt.toFixed(2)))}</td></tr>
+      ${order.payment_method && order.payment_method.toLowerCase().includes("card")
+        ? `<tr><td class="l">Payment Processing Fee:</td><td class="r" style="color:#888">Included</td></tr>` : ""}
+      <tr class="inv-total-row"><td class="l">Total:</td><td class="r">LKR ${escapeHtml(String(totalAmt.toFixed(2)))}</td></tr>
+    </table>
+  </div>
+
+  <!-- Partner badges -->
+  <div class="inv-partners">
+    ${msPartnerHtml}
+    ${easeusPartnerHtml}
+  </div>
+
+  <div class="inv-footer">
+    This is a system-generated invoice. &nbsp;|&nbsp; RedTrex Technologies &nbsp;|&nbsp; www.redtrex.com.lk
+  </div>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+  // Render barcode for Order ID
+  try {
+    JsBarcode("#inv-barcode", ${JSON.stringify(order.order_id)}, {
+      format: "CODE128",
+      width: 1.4,
+      height: 48,
+      displayValue: false,
+      margin: 0,
+      background: "#ffffff",
+      lineColor: "#000000"
+    });
+  } catch(e) { document.getElementById("inv-barcode").style.display = "none"; }
+
+  async function downloadInvoice() {
+    var btn = document.getElementById("dlBtn");
+    var toolbar = document.getElementById("toolbar");
+    btn.disabled = true;
+    btn.textContent = "⏳ Generating...";
+    toolbar.style.display = "none";
+
+    try {
+      var { jsPDF } = window.jspdf;
+      var el = document.getElementById("invoice-body");
+
+      var origW = el.style.width;
+      el.style.width = "794px";
+
+      var canvas = await html2canvas(el, {
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        backgroundColor: "#ffffff",
+        logging: false,
+        width: 794,
+        windowWidth: 794
+      });
+
+      el.style.width = origW;
+
+      var pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+      var pageW  = pdf.internal.pageSize.getWidth();
+      var pageH  = pdf.internal.pageSize.getHeight();
+      var margin = 10;
+      var usableW = pageW - margin * 2;
+      var usableH = pageH - margin * 2;
+
+      var cW = canvas.width, cH = canvas.height;
+      var mmPerPx   = usableW / cW;
+      var pxPerPage = Math.floor(usableH / mmPerPx);
+      var pages     = Math.ceil(cH / pxPerPage);
+
+      for (var p = 0; p < pages; p++) {
+        if (p > 0) pdf.addPage();
+        var srcY = p * pxPerPage;
+        var srcH = Math.min(pxPerPage, cH - srcY);
+
+        var sc = document.createElement("canvas");
+        sc.width = cW; sc.height = srcH;
+        sc.getContext("2d").drawImage(canvas, 0, srcY, cW, srcH, 0, 0, cW, srcH);
+
+        pdf.addImage(sc.toDataURL("image/jpeg", 0.97), "JPEG",
+                     margin, margin, usableW, srcH * mmPerPx);
+      }
+
+      pdf.save("Invoice-${safeInvoiceNum}.pdf");
+    } catch(e) {
+      alert("PDF generation failed: " + e.message);
+    } finally {
+      toolbar.style.display = "flex";
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Invoice PDF";
+    }
+  }
+</script>
+</body></html>`);
 });
 
 app.post("/admin/order/:id", requireAdmin, requireCsrf, async (req, res) => {
